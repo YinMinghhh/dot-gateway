@@ -1,0 +1,31 @@
+[project]
+name = "dot-gateway"
+version = "0.2.0"
+description = "MCP gateway that lets ChatGPT Dot drive ACP coding agents (dsh, later pi) on this machine as multi-turn sessions"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "YinMinghhh" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "mcp>=2.3,<3",
+]
+
+[project.scripts]
+dot-gateway = "dot_gateway.server:main"
+
+[build-system]
+requires = ["uv_build>=0.11.14,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+anyio_mode = "strict"

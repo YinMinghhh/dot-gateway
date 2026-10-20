@@ -1,0 +1,40 @@
+# Python / uv
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Test, lint and coverage caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Local runtime state, logs, scratch (the gateway's real state lives in ~/Library/Application Support)
+state/
+*.state/
+tmp/
+scratch/
+*.log
+*.tmp
+*.bak
+*.swp
+.patch*.py
+
+# Secrets and local env
+.env
+.env.*
+
+# Real LaunchAgents are machine-local; only the documented example is tracked
+*.plist
+!docs/*.plist.example
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
