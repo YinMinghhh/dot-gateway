@@ -44,11 +44,20 @@ MAX_TOOL_STORED = 1024 * 1024  # per string, in tool-calls/<id>.json (full detai
 DEFAULT_TOOL_BYTES = 32 * 1024
 MAX_TOOL_BYTES = 256 * 1024
 MAX_TOOL_SUMMARIES = 200  # one-line tool summaries kept per prompt
+TOOL_OUTPUT_PREVIEW_BYTES = 2 * 1024  # per tool call, for get_events(includeToolOutput=true)
+TOOL_OUTPUT_TOTAL_BYTES = 8 * 1024  # whole toolOutputs list, for get_events(includeToolOutput=true)
+TOOL_OUTPUT_MAX_ITEMS = 50
 VIEWS = ("final", "messages", "full")
 _QUIET_KINDS = {"usage_update", "available_commands_update", "config_option_update", "current_mode_update"}
 MAX_PROMPT_WAIT_MS = 60_000  # prompt(waitMs): returns 'running' after this
 MAX_WAIT_MS = 30_000  # get_events(waitMs) long-poll
 READ_KINDS = ("read", "search", "fetch", "think")
+OPERATOR_PERMISSION_NOTE = (
+    "operator only answers permission requests the agent sends; sandbox-allowed work needs no approval, so an "
+    "empty pendingPermissions is normal. If the agent asks for a wider sandbox on one call (e.g. a denied "
+    "command retried with danger-full-access), it waits in pendingPermissions until resolve_permission; "
+    "allow-once widens that call only and does not change the session permissionMode."
+)
 _SID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 
 
@@ -434,9 +443,36 @@ class SessionManager:
             self._emit(sid, "agent_exited", {"returncode": code, "note": "unexpected; next prompt re-attaches"},
                        rt.prompt_id)
 
+    def _tool_call_details(self, rt: Runtime, tool_call_id: str) -> dict[str, Any]:
+        """Best-effort tool info for permission requests that only carry a toolCallId (dsh-acp sandbox
+        escalation does this: the ACP request carries no title/kind/rawInput)."""
+        out: dict[str, Any] = {}
+        if rt.sid is not None:
+            try:
+                full = json.loads(self._tool_path(rt.sid, tool_call_id).read_text())
+            except (OSError, ValueError):
+                full = None
+            if full is not None:
+                for k in ("title", "kind", "status", "rawInput"):
+                    if full.get(k) is not None:
+                        out[k] = full[k]
+        if rt.prompt_id:
+            summ = (rt.tools.get(rt.prompt_id) or {}).get(tool_call_id)
+            if summ:
+                for k in ("title", "kind", "status"):
+                    if k not in out and summ.get(k) is not None:
+                        out[k] = summ[k]
+                if "rawInput" not in out and summ.get("input"):
+                    out["rawInput"] = {"command": summ["input"]}
+        return out
+
     async def _on_permission(self, rt: Runtime, params: dict[str, Any]) -> dict[str, Any]:
         sid = rt.sid
-        tool = params.get("toolCall") or {}
+        tool = dict(params.get("toolCall") or {})
+        tcid = tool.get("toolCallId")
+        if tcid:
+            for key, value in self._tool_call_details(rt, str(tcid)).items():
+                tool.setdefault(key, value)
         options = params.get("options") or []
         policy = rt.policy
         pid = "perm-" + uuid.uuid4().hex[:12]
@@ -448,6 +484,11 @@ class SessionManager:
             "policy": policy,
             "requestedAt": now_iso(),
         }
+        if sid is not None:
+            rec = self._records.get(sid)
+            pr = self._prompt(rec, rt.prompt_id) if rec is not None else None
+            if pr is not None:  # visible as prompt.permissionRequests while the turn still runs
+                pr["permission_requests"] = int(pr.get("permission_requests") or 0) + 1
         self._emit(sid, "permission_request", info, rt.prompt_id)
         by = "policy"
         if policy == "operator" and sid is not None:
@@ -507,13 +548,18 @@ class SessionManager:
         include_text: bool = False,
         covered: bool = False,
         reply_bytes: int = DEFAULT_REPLY_BYTES,
+        view: str = "final",
+        after_sequence: int | None = 0,
+        include_tool_output: bool = False,
     ) -> dict[str, Any] | None:
-        """Concise view of one turn. The final reply `text` is sent once: on the first response that sees the
-        turn finished (deliver=True marks it delivered), again when the page covers the turn's prompt_finished
-        event (a re-poll from the same cursor), or on request (include_text)."""
+        """Concise view of one turn. Delivery is decoupled from event paging: 'final' delivers an undelivered
+        reply on the first response; 'messages'/'full' only on the page that covers the turn's prompt_finished.
+        Once delivered, the text comes back only with include_text, or when the caller retries the exact
+        after_sequence of the response that delivered it (lost response)."""
         if pr is None:
             return None
-        v: dict[str, Any] = {"prompt_id": pr["prompt_id"], "state": pr["state"], "stop_reason": pr.get("stop_reason")}
+        v: dict[str, Any] = {"prompt_id": pr["prompt_id"], "state": pr["state"], "stop_reason": pr.get("stop_reason"),
+                             "permission_requests": int(pr.get("permission_requests") or 0)}
         if pr.get("error"):
             v["error"] = pr["error"]
         if pr["state"] == "running":
@@ -523,28 +569,66 @@ class SessionManager:
             v["progress"] = {"tool_calls": len(tools), "last_tool": _tool_line(tools[-1]) if tools else None,
                              "messages": len(agg["order"]) if agg else 0}
             return v
+        tools = pr.get("tool_calls") or []
         raw = (pr.get("reply_text") or "").encode()
         v["text_bytes"] = len(raw)
         delivered = pr.get("delivered_at_sequence")
-        if include_text or delivered is None or covered:
+        delivered_from = pr.get("delivered_from_sequence")
+        first_delivery = delivered is None and (view == "final" or covered)
+        # Same-cursor republish is for event views only: a caller retrying the page whose response was lost.
+        # 'final' never pages, so repeated polling (even with after_sequence=0) must not duplicate the reply;
+        # recover it explicitly with include_text / get_session(detail="full").
+        lost_retry = (view != "final" and delivered is not None and delivered_from is not None
+                      and after_sequence == delivered_from)
+        if include_text or first_delivery or lost_retry:
             v["text"] = raw[:reply_bytes].decode("utf-8", errors="ignore")
             if len(raw) > reply_bytes or pr.get("reply_truncated"):
                 v["text_truncated"] = True
-            tools = pr.get("tool_calls") or []
             if tools:
                 v["tool_calls"] = [_tool_line(t) for t in tools]
+                v["tool_call_ids"] = [t.get("tool_call_id") for t in tools]
             if pr.get("git_summary"):
                 v["git_summary"] = pr["git_summary"]
             if delivered is None and deliver:
                 pr["delivered_at_sequence"] = pr.get("last_sequence") or self._log(rec["session_id"]).latest
+                pr["delivered_from_sequence"] = after_sequence
                 self._save(rec)
-        else:
+        elif delivered is not None:
             v["delivered_at_sequence"] = delivered
+        if include_tool_output and tools:
+            v["tool_outputs"] = self._tool_outputs(rec["session_id"], tools)
         return v
+
+    def _tool_outputs(self, sid: str, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Bounded output evidence for get_events(includeToolOutput=true); full text stays in get_tool_call."""
+        out: list[dict[str, Any]] = []
+        used = 0
+        for t in tools:
+            tid = t.get("tool_call_id")
+            if not tid or len(out) >= TOOL_OUTPUT_MAX_ITEMS or used >= TOOL_OUTPUT_TOTAL_BYTES:
+                break
+            try:
+                full = json.loads(self._tool_path(sid, tid).read_text())
+            except (OSError, ValueError):
+                continue
+            raw = _tool_output_text(full).encode()
+            room = min(TOOL_OUTPUT_PREVIEW_BYTES, TOOL_OUTPUT_TOTAL_BYTES - used)
+            chunk = raw[:room].decode("utf-8", errors="ignore")
+            got = len(chunk.encode())
+            out.append({
+                "tool_call_id": tid,
+                "title": full.get("title") or t.get("title"),
+                "status": full.get("status") or t.get("status"),
+                "output": chunk,
+                "output_bytes": len(raw),
+                "truncated": bool(full.get("truncated")) or got < len(raw),
+            })
+            used += got
+        return out
 
     def _summary(self, rec: dict[str, Any]) -> dict[str, Any]:
         sid = rec["session_id"]
-        return {
+        view = {
             "session_id": sid,
             "agent_id": rec["agent_id"],
             "cwd": rec["cwd"],
@@ -553,6 +637,9 @@ class SessionManager:
             "permission_mode": rec.get("permission_mode"),
             "permission_policy": rec.get("permission_policy"),
         }
+        if view["permission_policy"] == "operator":
+            view["permission_note"] = OPERATOR_PERMISSION_NOTE
+        return view
 
     @staticmethod
     def _pending(rec: dict[str, Any]) -> list[dict[str, Any]]:
@@ -560,7 +647,9 @@ class SessionManager:
         for info in rec.get("pending_permissions") or []:
             tc = info.get("toolCall") or {}
             out.append({"permission_id": info.get("permissionId"), "prompt_id": info.get("promptId"),
+                        "tool_call_id": tc.get("toolCallId"),
                         "tool": _tool_line({"title": tc.get("title"), "kind": tc.get("kind"),
+                                            "status": tc.get("status"),
                                             "input": _one_line(tc.get("rawInput")) if tc.get("rawInput") else None}),
                         "options": [{"optionId": o.get("optionId"), "name": o.get("name"), "kind": o.get("kind")}
                                     for o in info.get("options") or []]})
@@ -774,6 +863,8 @@ class SessionManager:
                 "reply_text": "",
                 "reply_truncated": False,
                 "delivered_at_sequence": None,
+                "delivered_from_sequence": None,
+                "permission_requests": 0,
                 "tool_calls": [],
             }
             rec.setdefault("prompts", []).append(pr)
@@ -799,10 +890,14 @@ class SessionManager:
             budget = min(max(0, int(wait_ms)), MAX_PROMPT_WAIT_MS) / 1000 - (time.monotonic() - t0)
             if budget > 0:
                 await asyncio.wait({rt.prompt_task}, timeout=budget)
-        turn = self._turn(rec, self._prompt(rec, prompt_id), deliver=True)
+        turn = self._turn(rec, self._prompt(rec, prompt_id), deliver=True, view="final", after_sequence=None)
         if turn is not None and resumed:
             turn["resumed"] = True
-        return {"session_id": session_id, "prompt_id": prompt_id, "prompt": turn}
+        out = {"session_id": session_id, "prompt_id": prompt_id, "prompt": turn,
+               "permission_mode": mode, "permission_policy": policy}
+        if policy == "operator":
+            out["permission_note"] = OPERATOR_PERMISSION_NOTE
+        return out
 
     async def _run_prompt(self, rec: dict[str, Any], rt: Runtime, prompt_id: str, fut: asyncio.Future) -> None:
         sid = rec["session_id"]
@@ -867,6 +962,7 @@ class SessionManager:
         reply_bytes: int = DEFAULT_REPLY_BYTES,
         view: str = "final",
         include_text: bool = False,
+        include_tool_output: bool = False,
     ) -> dict[str, Any]:
         if view not in VIEWS:
             raise SessionError("BAD_ARGUMENT", f"view must be one of {VIEWS}")
@@ -889,19 +985,36 @@ class SessionManager:
                     break
         limit = max(1, min(int(limit), 500))
         max_bytes = max(1024, min(int(max_bytes), MAX_EVENT_BYTES))
-        events, next_seq, has_more = lg.read(after_sequence, limit, max_bytes, include_thoughts)
         pr = self._last_prompt(rec)
-        last = (pr or {}).get("last_sequence")
-        covered = bool(last) and after_sequence < last <= next_seq
-        out: dict[str, Any] = {
-            "session_id": session_id,
-            "state": rec["state"],
-            "next_sequence": next_seq,
-            "has_more": has_more,
-            "latest_sequence": lg.latest,
-            "prompt": self._turn(rec, pr, deliver=True, include_text=include_text, covered=covered,
-                                 reply_bytes=max(0, min(int(reply_bytes), MAX_REPLY_BYTES))),
-        }
+        reply_limit = max(0, min(int(reply_bytes), MAX_REPLY_BYTES))
+        events: list[dict[str, Any]] = []
+        if view == "final":
+            # final is a results view, not an event view: it never pages events, so nextSequence is just
+            # the latest journal position (callers can advance past it) and hasMore is always false.
+            out: dict[str, Any] = {
+                "session_id": session_id,
+                "state": rec["state"],
+                "next_sequence": lg.latest,
+                "has_more": False,
+                "latest_sequence": lg.latest,
+                "prompt": self._turn(rec, pr, deliver=True, include_text=include_text,
+                                     reply_bytes=reply_limit, view="final", after_sequence=after_sequence,
+                                     include_tool_output=include_tool_output),
+            }
+        else:
+            events, next_seq, has_more = lg.read(after_sequence, limit, max_bytes, include_thoughts)
+            last = (pr or {}).get("last_sequence")
+            covered = bool(last) and after_sequence < last <= next_seq
+            out = {
+                "session_id": session_id,
+                "state": rec["state"],
+                "next_sequence": next_seq,
+                "has_more": has_more,
+                "latest_sequence": lg.latest,
+                "prompt": self._turn(rec, pr, deliver=True, include_text=include_text, covered=covered,
+                                     reply_bytes=reply_limit, view=view, after_sequence=after_sequence,
+                                     include_tool_output=include_tool_output),
+            }
         pending = self._pending(rec)
         if pending:
             out["pending_permissions"] = pending
@@ -1129,6 +1242,7 @@ class SessionManager:
                   "prompt_preview": (p.get("text_preview") or "")[:PREVIEW_CHARS],
                   "text_bytes": len((p.get("reply_text") or "").encode()),
                   "delivered_at_sequence": p.get("delivered_at_sequence"),
+                  "permission_requests": int(p.get("permission_requests") or 0),
                   "tool_call_count": len(self._tool_summaries(p))}
             if p.get("error"):
                 it["error"] = p["error"]

@@ -7,7 +7,7 @@
 - 网关是一个 MCP 服务（Python，`uv` 管理）。它把 MCP 工具调用翻译成 ACP（Agent Client Protocol），通过 stdio 驱动本机的编码 agent。一个 MCP 会话对应一个 ACP 会话，支持多轮对话。
 - 内置的 agent 是 DeepSeek Harness：`dsh --profile acp`。以后接 pi 走 `pi-acp`，在配置文件里加一项就行。
 - 工具名照 [kxress/acp-mcp](https://github.com/kxress/acp-mcp) 起。没有直接用 acp-mcp，原因有两个：它要求 Node ≥ 24.12，而本机是 v22；它的 `load_session` 走 `session/load`，dsh 不支持这个方法。
-- 按所有者的决定，网关**不加安全限制**：没有确认环节，没有仓库白名单，不隔离工作区，不限制推送和合并，不设任务超时，不留审计日志，也没有停用开关。权限策略只决定网关怎么回答 agent 的权限请求。
+- 按所有者的决定，网关**不加安全限制**：没有确认环节，没有仓库白名单，不隔离工作区，不限制推送和合并，不设任务超时，不留审计日志，也没有停用开关。权限策略只决定网关怎么回答 agent **自己发起**的权限请求，不是每次写入或命令的审批开关。
 
 ## 代码结构
 
@@ -39,25 +39,30 @@ scripts/start.sh --port 18765          # 本地试跑时换一个端口，不要
 
 ## 工具语义（简洁输出）
 
-每个工具返回**一个紧凑的 JSON 文本块**（不缩进，也不再附带一份重复的 `structuredContent`），字段统一用 camelCase。
+每个工具返回**一个紧凑的 JSON 文本块**（不缩进），字段统一用 camelCase。网关**不返回 `structuredContent`**：同一份 JSON 不再重复一份，文本块就是稳定契约，调用方只解析 `content[0].text` 即可。
 
-- `start_session` / `load_session` 只返回 `sessionId`、`agentId`、`cwd`、`state`、`live`、`permissionMode`、`permissionPolicy`，再加上 `promptId` 或 `note`（如果有）。
-- `prompt` 返回 `{sessionId, promptId, prompt}`。设了 `waitMs` 并且这一轮在时限内跑完，`prompt.text` 就是最终答复，算作已经投递。
-- `get_events(view=...)` 的三种视图翻页方式相同，都是 `afterSequence` → `nextSequence` / `hasMore`，`limit` 最大 500，`maxBytes` 最大 1 MiB：
-  - `final`（默认）：不返回事件列表，只返回 `prompt`。
+- `start_session` / `load_session` 只返回 `sessionId`、`agentId`、`cwd`、`state`、`live`、`permissionMode`、`permissionPolicy`，再加上 `promptId` 或 `note`（如果有）。`permissionPolicy` 为 `operator` 时另有 `permissionNote`（一段固定的说明文本）。
+- `prompt` 返回 `{sessionId, promptId, permissionMode, permissionPolicy, prompt}`；`permissionMode` / `permissionPolicy` 是这一轮实际生效的值，`permissionPolicy` 为 `operator` 时另有 `permissionNote`。设了 `waitMs` 并且这一轮在时限内跑完，`prompt.text` 就是最终答复，算作已经投递。
+- `get_events(view=...)`：
+  - `final`（默认）：不返回事件列表，只返回 `prompt`。这个视图**不按事件分页**：`nextSequence` 恒等于 `latestSequence`，`hasMore` 恒为 `false`，按固定间隔重发即可；交付后再查不会重复，即使游标不变。
     - 运行中时，`prompt` 里有 `progress`：工具调用次数、最近一次工具调用的一行摘要、消息数。
-    - 结束后，`prompt` 里有 `text`（这一轮**最后一条** agent 消息，中间的过渡话不算）、`toolCalls`（每次工具调用一行，例如 `bash: ls -la → completed`）和 `gitSummary`。
+    - 结束后，`permissionRequests`（本轮 ACP 权限请求次数，`0` 表示 agent 一次都没问）始终给；交付答复的响应里还给 `text`（这一轮**最后一条** agent 消息，中间的过渡话不算）、`toolCalls`（每次工具调用一行，例如 `bash: ls -la → completed`）、与 `toolCalls` 等长同序的 `toolCallIds` 和 `gitSummary`。
     - `waitMs`（最大 30000）会一直等到这一轮结束或出现权限请求。
-  - `messages`：同一条消息的多个分片合并成一整条；每次工具调用一行，带 `toolCallId`；不含 `usage_update` 这类噪声，也不含思考内容（除非 `includeThoughts`）。如果这一页的 `prompt.text` 已经带了最终答复，对应那条消息只标 `textInPrompt: true`，不重复正文。
+    - `includeToolOutput=true` 时，已结束的 `prompt`（任何视图都适用）还会给 `toolOutputs`：`[{toolCallId, title, status, output, outputBytes, truncated}]`。`output` 是截断后的预览（单条最多 2 KiB，整个响应最多 8 KiB），`outputBytes` 是完整输出的字节数，`truncated` 表示预览被截断。完整输入输出仍用 `get_tool_call`。
+  - `messages`：同一条消息的多个分片合并成一整条；每次工具调用一行，带 `toolCallId`；不含 `usage_update` 这类噪声，也不含思考内容（除非 `includeThoughts`）。如果这一页的 `prompt.text` 带了最终答复（只有覆盖轮末的那一页会带），对应那条消息只标 `textInPrompt: true`，不重复正文。
   - `full`：原始 ACP `session/update` 事件，外加网关自己的事件。思考内容只有 `includeThoughts=true` 时才给。
-- **最终答复只投递一次。** 投递以后再查，只返回 `textBytes` 和 `deliveredAtSequence`。下面三种情况会再给一次：
-  - 从这一轮结束之前的游标重新轮询（应对响应丢失）；
-  - 传 `includeText=true`；
-  - `get_session(detail="full")`，它总是带全部答复。
+  - 只有 `messages` / `full` 按事件分页：`afterSequence` → `nextSequence` / `hasMore`，`limit` 最大 500，`maxBytes` 最大 1 MiB。
+- **最终答复只投递一次。** 投递以后再查，不再返回 text/toolCalls，只返回 `textBytes`、`deliveredAtSequence` 和 `permissionRequests`。
+  - `final` 视图在第一次看到这一轮结束的响应里给 `text`；之后即使 `afterSequence` 不变再查也不会重复。
+  - `messages` / `full` 只在**覆盖本轮结束**（`prompt_finished`）的那一页给，后续页不重复；用交付时相同的 `afterSequence` 重试那一页（应对响应丢失）会再给一次。
+  - 另外两种再取一次的方式：传 `includeText=true`，或 `get_session(detail="full")`（它总是带全部答复）。
+  - `prompt(waitMs=...)` 在调用里直接交付的答复，用 `get_events(includeText=true)` 或 `get_session(detail="full")` 恢复。
   
-  投递状态保存在 `session.json` 里，网关重启后也不会丢。
-- `get_session(detail="summary")` 不带答复正文。`detail="full"` 会带上每一轮的答复、工具调用行和 `toolCallId`、git 摘要、配置项（可选模型）、agent 能力和进程信息。
+  投递状态保存在 `session.json` 里，网关重启后也不会丢；`messages` / `full` 的同游标恢复用的是交付时记下的游标。升级前已经交付过、但没有记录游标的旧轮次，用 `includeText=true` 或 `get_session(detail="full")` 恢复。
+- **等审批时看 `pendingPermissions`。** `get_events`（任何视图）和 `get_session` 在轮次等待权限回答时会带 `pendingPermissions`：`[{permissionId, promptId, toolCallId, tool, options}]`。dsh-acp 的请求只带 `toolCallId`，网关用本会话的工具记录回填成一行 `tool`（例如 `bash: rm -rf … → in_progress`），回填不到就是 `tool`；`options` 里的 `optionId` 交给 `resolve_permission`。
+- `get_session(detail="summary")` 不带答复正文；summary 和 `start_session` / `load_session` 一样带 `permissionMode`、`permissionPolicy`、`permissionNote`（operator 时）和 `pendingPermissions`。`detail="full"` 会带上每一轮的答复、工具调用行和 `toolCallId`、git 摘要、配置项（可选模型）、agent 能力和进程信息。
 - `get_tool_call(sessionId, toolCallId, offset, maxBytes)` 返回某次工具调用的完整输入和输出，输出按字节分页（每页最大 256 KiB）。这份完整记录存在 `tool-calls/<id>.json`，每个字符串最多 1 MiB。事件日志里的字符串只保留到 8 KiB。
+- **拿不到退出码。** ACP 的 `tool_call_update` 没有独立的 exit code 字段，dsh 的成功命令输出里也可能没有退出码标记。判断成败看 `status`（例如 `completed` / `failed`）、`toolOutputs` 或事件里的 stdout/stderr 文本，以及 `get_tool_call` 的完整输出；文档和工具描述都不承诺退出码。
 - `list_sessions` 每个会话只给状态和最近一轮的预览（200 字），不带答复。`close_session` 只返回 `{sessionId, state, note}`。`cancel_prompt` 只返回这一轮的状态。
 
 ### 时间约束
@@ -81,14 +86,26 @@ scripts/start.sh --port 18765          # 本地试跑时换一个端口，不要
 
 ## 权限
 
-1. **`permissionMode`：agent 自己的沙箱。** dsh 的取值是 `read-only`、`workspace-write`（默认）、`danger-full-access`，通过 `DSH_PERMISSION_MODE` 生效。`start_session` 里设的是会话默认值，`prompt` 里设的只对这一轮生效。模式改了，网关会重启 agent，再用 `session/resume` 接回会话。
-2. **`permissionPolicy`：网关怎么回答 agent 的 `session/request_permission`。** 命名照 acp-mcp：
-   - `read_only`（默认）：`read`、`search`、`fetch`、`think` 类的请求选 allow，其他都选 reject；
+网关的权限有两层，各管一件事：`permissionMode` 是 agent 自己的沙箱；`permissionPolicy` 只决定网关怎么回答 agent **自己发起**的 `session/request_permission`。网关不拦截工具调用本身——沙箱允许的操作直接执行，不需要任何审批，所以“没有挂起项”通常是正常的。
+
+1. **`permissionMode`：agent 自己的沙箱。** dsh 的取值是 `read-only`、`workspace-write`（默认）、`danger-full-access`，通过 `DSH_PERMISSION_MODE` 生效。`start_session` 里设的是会话默认值，`prompt` 里设的只对这一轮生效，`load_session` 也能改会话默认值。模式改了，网关会重启 agent，再用 `session/resume` 接回会话。
+2. **`permissionPolicy`：网关怎么回答这些请求。** 命名照 acp-mcp：
+   - `read_only`（默认）：`read`、`search`、`fetch`、`think` 类的请求选 allow，其他都选 reject。dsh-acp 的升级请求只带 `toolCallId`、不带 `kind`，网关按非读类处理，所以默认策略下这类升级会被自动拒绝；
    - `allow_all`：全部选 allow；
    - `deny_all`：全部选 reject；
-   - `operator`：请求挂起，出现在 `pendingPermissions` 里，等 `resolve_permission` 回答。没人回答就一直等着；`cancel_prompt` 会把挂起的请求全部回答为 cancelled。
+   - `operator`：请求挂起，出现在 `pendingPermissions` 里，等 `resolve_permission` 用某个 `optionId` 回答。没人回答就一直等着；`cancel_prompt` 会把挂起的请求全部回答为 cancelled。
 
-实测 dsh 0.2.1-rc.2 在 `workspace-write` 模式下，往 cwd 里写文件、跑 shell 命令都不会发权限请求，所以默认的 `read_only` 挡不住它。如果 dsh 发出写入或执行类请求，就要对那一轮传 `permissionPolicy: "allow_all"`。
+**dsh 的沙箱升级（escalation）链路。** 某个调用被沙箱拒绝后，模型可以对**同一个调用**重试一次，带上 `sandbox_permissions`（严格更宽一档，例如 `workspace-write` 被拒后申请 `danger-full-access`）和 `justification`。dsh 在执行这次调用前走自己的 approval：`workspace-write` / `read-only` 预设的 approval 是 `ask`，`danger-full-access` 预设是 `never`；`ask` 时 dsh-acp 把它桥接成 ACP 的 `session/request_permission`。审批请求只在这类“agent 申请更宽沙箱”的场景出现，不是每次写入都有。
+
+**空 `pendingPermissions` 和 0 条 `permissionRequests` 通常是正常的。** 实测 dsh 0.2.1-rc.2 在 `workspace-write` 下创建/编辑文件、执行 shell 命令都不会发权限请求，所以默认的 `read_only` 挡不住这类操作，`operator` 也没有东西可挂；没有挂起项不代表策略没生效。
+
+**`pendingPermissions` 的条目**是 `{permissionId, promptId, toolCallId, tool, options}`。dsh-acp 的请求只带 `toolCallId`，网关会从本会话的工具记录（`tool-calls/<id>.json` 和当前轮的摘要）回填 title/kind/status/rawInput，把 `tool` 渲染成一行，例如 `bash: rm -rf … → in_progress`；回填不到时保持 `tool`。
+
+**allow-once 只放宽该次调用**，不改变会话的 `permissionMode`。要整个会话换档，用 `prompt(permissionMode=...)`（网关会重启 agent 并 `session/resume`）。
+
+**限制：** dsh-acp 目前不把申请的模式和 `justification` 透传给 ACP，所以网关只能回填工具信息，不能展示“申请 `danger-full-access` 及原因”。
+
+**回显。** `permissionPolicy` 为 `operator` 时，`prompt` 响应、`start_session` / `load_session` / `get_session(detail="summary")` 的 summary 都带 `permissionNote`（就是上面这些语义的固定说明文本）。`prompt` 响应还回显这一轮实际生效的 `permissionMode` / `permissionPolicy`；这一轮 agent 发过几次权限请求，看 final 视图的 `permissionRequests`。
 
 ## 状态、续接与恢复
 

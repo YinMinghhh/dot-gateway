@@ -464,13 +464,15 @@ async def test_final_text_is_last_message_and_delivered_once(manager, repo):
     p = r["prompt"]
     assert p["state"] == "completed" and p["text"] == "Final: two files."  # not the in-between remark
     assert p["tool_calls"] == ["bash: ls -la → completed"] and "events" not in r
+    assert len(p["tool_call_ids"]) == 1 and p["tool_call_ids"][0].startswith("tc-")
+    assert p["permission_requests"] == 0
     end = r["next_sequence"]
     # Delivered once: a later poll from the new cursor gets no text, only its size and where it was delivered.
     r2 = await manager.get_events(sid, after_sequence=end)
     assert "text" not in r2["prompt"] and r2["prompt"]["text_bytes"] == len("Final: two files.")
     assert r2["prompt"]["delivered_at_sequence"] == end
-    # Recoverable: re-poll from an older cursor (lost response), includeText, or get_session(detail=full).
-    assert (await manager.get_events(sid, after_sequence=0))["prompt"]["text"] == "Final: two files."
+    # 'final' never republishes on a repeated poll; recover it explicitly with includeText/get_session.
+    assert "text" not in (await manager.get_events(sid, after_sequence=0))["prompt"]
     assert (await manager.get_events(sid, after_sequence=end, include_text=True))["prompt"]["text"] == "Final: two files."
     full = await manager.get_session(sid, detail="full")
     assert full["prompts"][-1]["text"] == "Final: two files." and full["prompts"][-1]["tool_calls"][0]["line"].startswith("bash")
@@ -490,6 +492,9 @@ async def test_prompt_wait_delivers_text_once(manager, repo):
     assert r["prompt"]["text"] == "quick"
     g = await manager.get_events(sid, after_sequence=(await manager.get_session(sid))["latest_sequence"])
     assert "text" not in g["prompt"] and g["prompt"]["delivered_at_sequence"]
+    # prompt(waitMs) has no event cursor to retry: recover with includeText (or get_session detail=full)
+    assert "text" not in (await manager.get_events(sid, after_sequence=0))["prompt"]
+    assert (await manager.get_events(sid, include_text=True))["prompt"]["text"] == "quick"
 
 
 async def test_messages_view_coalesces_and_summarizes_tools(manager, repo):
@@ -511,11 +516,12 @@ async def test_messages_view_coalesces_and_summarizes_tools(manager, repo):
     assert started["textPreview"].startswith("say part1")
     r = await manager.get_events(sid, view="messages", include_thoughts=True, limit=500)
     assert any(e["kind"] == "thought" and e["text"] == "secret" for e in r["events"])
-    # Paging is identical across views.
+    # messages/full page events; final never does (nextSequence is just the latest journal position).
     a = await manager.get_events(sid, view="full", limit=3)
     b = await manager.get_events(sid, view="messages", limit=3)
     c = await manager.get_events(sid, view="final", limit=3)
-    assert a["next_sequence"] == b["next_sequence"] == c["next_sequence"] and a["has_more"] == b["has_more"] == c["has_more"]
+    assert a["next_sequence"] == b["next_sequence"] and a["has_more"] == b["has_more"] is True
+    assert c["next_sequence"] == c["latest_sequence"] and c["has_more"] is False and "events" not in c
     with pytest.raises(SessionError):
         await manager.get_events(sid, view="verbose")
 
@@ -555,3 +561,101 @@ async def test_get_tool_call_full_record_paged(manager, repo):
     with pytest.raises(SessionError) as e:
         await manager.get_tool_call(sid, "nope")
     assert e.value.code == "NOT_FOUND"
+
+
+async def test_final_view_never_pages_and_delivers_text_once(manager, repo):
+    s = await manager.start_session(str(repo), agent_id="fake", prompt="msg one\ntool bash echo|hi\nmsg done")
+    sid = s["session_id"]
+    r = await manager.get_events(sid, wait_ms=10000)
+    p = r["prompt"]
+    assert p["state"] == "completed" and p["text"] == "done"
+    assert r["has_more"] is False and r["next_sequence"] == r["latest_sequence"] and "events" not in r
+    # Advancing the cursor must not repeat the reply, even with a tiny page limit.
+    r2 = await manager.get_events(sid, after_sequence=r["next_sequence"], limit=1)
+    assert "text" not in r2["prompt"] and r2["prompt"]["delivered_at_sequence"] == r["next_sequence"]
+    assert r2["has_more"] is False
+    # A repeated final poll (even with after_sequence=0) must not duplicate the reply, but evidence is
+    # still available; includeText re-publishes it explicitly.
+    r3 = await manager.get_events(sid, after_sequence=0, include_tool_output=True)
+    assert "text" not in r3["prompt"] and r3["prompt"]["tool_outputs"][0]["output"] == "hi"
+    p3 = (await manager.get_events(sid, after_sequence=0, include_text=True,
+                                   include_tool_output=True))["prompt"]
+    assert p3["text"] == "done" and p3["permission_requests"] == 0
+    assert len(p3["tool_call_ids"]) == 1 and p3["tool_call_ids"][0].startswith("tc-")
+    out = p3["tool_outputs"]
+    assert out[0]["tool_call_id"] == p3["tool_call_ids"][0] and out[0]["output"] == "hi"
+    assert out[0]["output_bytes"] == 2 and out[0]["truncated"] is False
+    # includeText and get_session(detail="full") always recover it.
+    assert (await manager.get_events(sid, after_sequence=r["next_sequence"],
+                                     include_text=True))["prompt"]["text"] == "done"
+    assert (await manager.get_session(sid, detail="full"))["prompts"][-1]["text"] == "done"
+
+
+async def test_event_pages_deliver_text_only_on_the_page_covering_turn_end(manager, repo):
+    s = await manager.start_session(str(repo), agent_id="fake",
+                                    prompt="say a\nsay b\nsay c\ntool echo hi|hi\nmsg final")
+    sid = s["session_id"]
+    for _ in range(200):  # wait via get_session so the final view does not deliver the text
+        lp = (await manager.get_session(sid))["prompts"][-1]
+        if lp["state"] != "running":
+            break
+        await anyio.sleep(0.02)
+    pages, cursors, cur = [], [], 0
+    while True:
+        cursors.append(cur)
+        r = await manager.get_events(sid, after_sequence=cur, view="full", limit=2)
+        pages.append(r)
+        if not r["has_more"]:
+            break
+        cur = r["next_sequence"]
+    idx = next(i for i, r in enumerate(pages) if any(e["kind"] == "prompt_finished" for e in r["events"]))
+    assert pages[idx]["prompt"]["text"] == "final"
+    assert sum("text" in r["prompt"] for r in pages) == 1  # only the page covering the turn end
+    # Lost response: retrying the exact page that delivered it republishes the text (event views only).
+    retry = await manager.get_events(sid, after_sequence=cursors[idx], view="full", limit=2)
+    assert retry["prompt"]["text"] == "final"
+    last = pages[-1]
+    after = await manager.get_events(sid, after_sequence=last["next_sequence"], view="full")
+    assert "text" not in after["prompt"] and after["prompt"]["delivered_at_sequence"] is not None
+
+
+async def test_permission_requests_count_in_turn_view(manager, repo):
+    s = await manager.start_session(str(repo), agent_id="fake", prompt="perm edit",
+                                    permission_policy="allow_all")
+    r = await manager.get_events(s["session_id"], wait_ms=10000)
+    assert r["prompt"]["state"] == "completed" and r["prompt"]["permission_requests"] == 1
+    s2 = await manager.start_session(str(repo), agent_id="fake", prompt="say hi")
+    r2 = await manager.get_events(s2["session_id"], wait_ms=10000)
+    assert r2["prompt"]["permission_requests"] == 0
+
+
+async def test_operator_note_and_escalation_request_enrichment(manager, repo):
+    s = await manager.start_session(str(repo), agent_id="fake", permission_policy="operator",
+                                    prompt="escalate bash touch /tmp/nope|ok")
+    sid = s["session_id"]
+    assert s["permission_policy"] == "operator" and "permission_note" in s
+    pend = await wait_for(lambda: _pending(manager, sid))
+    perm = pend[0]
+    assert perm["tool_call_id"].startswith("tc-")
+    assert perm["tool"].startswith("bash: touch /tmp/nope") and "→ in_progress" in perm["tool"]
+    assert {o["optionId"] for o in perm["options"]} == {"allow-once", "reject-once"}
+    r = manager.resolve_permission(sid, perm["permission_id"], "allow-once")
+    assert r["resolved"]["option_id"] == "allow-once"
+    p = await wait_done(manager, sid)
+    assert p["text"] == "escalate: allow-once"
+    evs, _ = await all_events(manager, sid)
+    req = next(e for e in evs if e["kind"] == "permission_request")["update"]
+    assert req["toolCall"]["title"] == "bash" and req["toolCall"]["rawInput"]["command"] == "touch /tmp/nope"
+
+
+async def test_prompt_response_echoes_effective_permission_config(manager, repo):
+    s = await manager.start_session(str(repo), agent_id="fake")
+    sid = s["session_id"]
+    assert "permission_note" not in s
+    r = await manager.prompt(sid, "say run", permission_mode="high", permission_policy="deny_all")
+    assert (r["permission_mode"], r["permission_policy"]) == ("high", "deny_all")
+    assert "permission_note" not in r
+    assert (await wait_done(manager, sid))["text"] == "run"
+    r2 = await manager.prompt(sid, "say again", permission_policy="operator")
+    assert r2["permission_policy"] == "operator" and "permission_note" in r2
+    assert (await wait_done(manager, sid))["text"] == "again"

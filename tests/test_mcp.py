@@ -30,7 +30,8 @@ async def exercise(client, cwd):
     assert {t.name for t in (await client.list_tools()).tools} == TOOLS
     agents = payload(await client.call_tool("list_agents", {}))
     assert "dsh" in [a["agentId"] for a in agents["agents"]]
-    s = payload(await client.call_tool("start_session", {"cwd": cwd, "agentId": "fake", "prompt": "say one\nsleep 1"}))
+    s = payload(await client.call_tool("start_session", {"cwd": cwd, "agentId": "fake",
+                                                          "prompt": "say one\ntool bash echo|hi\nsleep 1"}))
     sid = s["sessionId"]
     busy = await client.call_tool("prompt", {"sessionId": sid, "text": "say two"})
     assert busy.is_error and "SESSION_BUSY" in busy.content[0].text
@@ -43,6 +44,12 @@ async def exercise(client, cwd):
             break
         await anyio.sleep(0.05)
     assert g["prompt"]["state"] == "completed" and g["prompt"]["text"] == "one" and "events" not in g
+    assert g["hasMore"] is False and g["prompt"]["permissionRequests"] == 0
+    assert len(g["prompt"]["toolCallIds"]) == 1
+    # includeToolOutput is forwarded through the MCP layer and camelized.
+    ev = payload(await client.call_tool("get_events", {"sessionId": sid, "afterSequence": 0,
+                                                       "includeText": True, "includeToolOutput": True}))
+    assert ev["prompt"]["toolOutputs"][0]["output"] == "hi"
     again = payload(await client.call_tool("get_events", {"sessionId": sid, "afterSequence": cur}))
     assert "text" not in again["prompt"] and again["prompt"]["deliveredAtSequence"] == cur
     full = payload(await client.call_tool("get_session", {"sessionId": sid, "detail": "full"}))
@@ -51,10 +58,35 @@ async def exercise(client, cwd):
     assert any(e["kind"] == "message" for e in msgs["events"])
     p = payload(await client.call_tool("prompt", {"sessionId": sid, "text": "recall", "waitMs": 5000}))
     assert p["sessionId"] == sid and "say one" in p["prompt"]["text"]
+    assert (p["permissionMode"], p["permissionPolicy"]) == ("low", "read_only") and "permissionNote" not in p
     lst = payload(await client.call_tool("list_sessions", {}))
     assert lst["sessions"][0]["sessionId"] == sid
     c = payload(await client.call_tool("close_session", {"sessionId": sid}))
     assert c == {"sessionId": sid, "state": "closed", "note": c["note"]}
+    # operator: dsh-acp-style escalation asks carry only a toolCallId; the gateway enriches them and waits.
+    op = payload(await client.call_tool("start_session", {"cwd": cwd, "agentId": "fake",
+                                                          "permissionPolicy": "operator",
+                                                          "prompt": "escalate bash echo|hi"}))
+    assert op["permissionPolicy"] == "operator" and op["permissionNote"]
+    pending = None
+    for _ in range(200):
+        g2 = payload(await client.call_tool("get_events", {"sessionId": op["sessionId"]}))
+        pending = (g2.get("pendingPermissions") or [None])[0]
+        if pending:
+            break
+        await anyio.sleep(0.05)
+    assert pending and pending["toolCallId"].startswith("tc-")
+    assert pending["tool"].startswith("bash: echo")
+    payload(await client.call_tool("resolve_permission", {"sessionId": op["sessionId"],
+                                                          "permissionId": pending["permissionId"],
+                                                          "optionId": "allow-once"}))
+    for _ in range(200):
+        g3 = payload(await client.call_tool("get_events", {"sessionId": op["sessionId"]}))
+        if g3["prompt"]["state"] != "running":
+            break
+        await anyio.sleep(0.05)
+    assert g3["prompt"]["text"] == "escalate: allow-once"
+    payload(await client.call_tool("close_session", {"sessionId": op["sessionId"]}))
     bad = await client.call_tool("get_events", {"sessionId": "nope"})
     assert bad.is_error and "SESSION_NOT_FOUND" in bad.content[0].text
 

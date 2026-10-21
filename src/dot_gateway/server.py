@@ -27,16 +27,45 @@ Run coding agents (default: dsh, DeepSeek Harness) on this machine as multi-turn
 Flow: start_session(cwd) -> prompt(sessionId, text) -> get_events(sessionId, waitMs=25000) until
 prompt.state is completed / failed / cancelled (the default view 'final' long-polls until the turn ends or a
 permission question appears) -> read prompt.text (the agent's final reply, sent once) and prompt.toolCalls
-(one line per tool call) -> prompt again to continue the same conversation -> close_session when done.
+(one line per tool call; the matching ids are prompt.toolCallIds) -> prompt again to continue the same
+conversation -> close_session when done.
 Every call returns within 60 s (the tunnel allows 120 s). One prompt at a time per session: prompting a busy
 session fails with SESSION_BUSY. Keep the sessionId; list_sessions finds it again.
-The final reply is delivered once; later responses show textBytes + deliveredAtSequence instead. If you lost
-it, call get_events(includeText=true) or get_session(detail='full'), which always return it.
-Details on demand: get_events(view='messages') = whole messages + one line per tool call;
-view='full' (+ includeThoughts) = raw ACP updates; get_tool_call(toolCallId) = one call's full input/output.
-Sessions survive gateway restarts and machine reboots (prompting re-attaches with session/resume).
-Permission requests are answered by permissionPolicy (default read_only); with 'operator' they appear in
-pendingPermissions until resolve_permission. If the machine is asleep or offline, calls fail at the tunnel.
+get_events views: 'final' (default) returns prompt only and does not page events (nextSequence is always
+latestSequence, hasMore is always false); 'messages' = whole messages + one line per tool call; 'full'
+(+ includeThoughts) = raw ACP updates. Only messages/full page through events: pass nextSequence back as
+afterSequence (nextSequence/hasMore, limit <= 500, maxBytes <= 1 MiB).
+The final reply is delivered once. 'final' returns it in the first response that sees the turn finished and
+never duplicates it on later polls, even if afterSequence does not move; 'messages'/'full' return it only on
+the page that covers the turn's prompt_finished event, and retrying that same page's afterSequence republishes
+it (lost response). After delivery you see textBytes, deliveredAtSequence and permissionRequests; recover it
+with includeText=true or get_session(detail='full'), which always has every reply. A reply delivered by
+prompt(waitMs) is recovered the same way (includeText or detail='full').
+get_events(includeToolOutput=true) adds prompt.toolOutputs for a finished turn: bounded stdout/stderr excerpts
+({toolCallId, title, status, output, outputBytes, truncated}; 2 KiB per call, 8 KiB per response). Raw tool
+stdout/stderr and larger output: get_tool_call(toolCallId), which has the full input and output.
+ACP has no exit-code field and dsh does not always print one: use status, the stdout/stderr text, and
+get_tool_call as evidence, not an exit code.
+Permissions have two layers. permissionMode is the agent's own sandbox (dsh: read-only | workspace-write |
+danger-full-access); it is not an approval switch. permissionPolicy (read_only | allow_all | deny_all |
+operator; default read_only) only decides how the gateway answers permission requests the agent sends itself:
+read_only auto-rejects non-read requests, allow_all auto-allows, deny_all auto-rejects, and operator holds a
+request in pendingPermissions until resolve_permission. Work the sandbox already allows needs no approval, so
+empty pendingPermissions and permissionRequests=0 are normal, not a broken setting.
+dsh escalation: after a sandbox denial dsh may retry the same call once with sandbox_permissions (one step
+strictly wider, e.g. workspace-write -> danger-full-access) plus a justification; it asks for approval before
+that call (workspace-write/read-only presets ask, danger-full-access preset never) and dsh-acp bridges the ask
+into ACP session/request_permission. Under operator such a request waits in pendingPermissions until
+resolve_permission; an allow-once answer widens that one call only and does not change the session
+permissionMode (change the session with prompt(permissionMode=...); the agent restarts and resumes).
+pendingPermissions entries are {permissionId, promptId, toolCallId, tool, options}: dsh-acp sends only the
+toolCallId, and the gateway backfills title/kind/status/input from this session's tool records into `tool`, one
+line like 'bash: rm -rf … → in_progress' ('tool' if nothing can be backfilled). Limit: dsh-acp does not forward
+the requested mode or justification, so the gateway cannot show which wider mode was asked for, or why.
+The prompt response echoes the turn's effective permissionMode and permissionPolicy and adds permissionNote
+under operator; start_session/load_session/get_session summaries add permissionNote under operator as well.
+Sessions survive gateway restarts and machine reboots (prompting re-attaches with session/resume). If the
+machine is asleep or offline, calls fail at the tunnel.
 """
 
 _NO_CAMEL = {"update", "tool_call", "options", "config_options", "capabilities", "agent_info", "error",
@@ -88,6 +117,7 @@ def build_server(manager: SessionManager) -> MCPServer:
     server = MCPServer(name="dot-gateway", title="Local coding agents (ACP)", version=__version__,
                        instructions=INSTRUCTIONS, log_level=manager.config.log_level)  # type: ignore[arg-type]
     policies = " | ".join(PERMISSION_POLICIES)
+    # Text-only contract: one compact JSON text block, no duplicate structuredContent. Keep it that way.
     tool = functools.partial(server.tool, structured_output=False)
 
     @tool(description="List configured ACP agents (dsh built in; more via the gateway config file), "
@@ -99,8 +129,10 @@ def build_server(manager: SessionManager) -> MCPServer:
         "Start a new ACP session (session/new) for agent `agentId` (default dsh) in absolute directory `cwd`. "
         "Returns sessionId (and promptId if `prompt` was given) at once; the first turn runs in the background - "
         "poll get_events. permissionMode (dsh: read-only | workspace-write | danger-full-access; default "
-        f"workspace-write) is the agent's own sandbox. permissionPolicy ({policies}; default read_only) decides "
-        "how the gateway answers the agent's permission requests. `model` (e.g. deepseek-v4-pro) or `config` "
+        f"workspace-write) is the agent's own sandbox. permissionPolicy ({policies}; default read_only) only "
+        "decides how the gateway answers permission requests the agent sends itself; sandbox-allowed work needs "
+        "no approval, so an empty pendingPermissions is normal, and under 'operator' the returned summary "
+        "includes permissionNote. `model` (e.g. deepseek-v4-pro) or `config` "
         "({configId: value}) set advertised ACP config options. Capabilities/config: get_session(detail='full')."))
     async def start_session(cwd: str, agentId: str = "dsh", prompt: str | None = None,
                             permissionMode: str | None = None, permissionPolicy: str | None = None,
@@ -116,9 +148,13 @@ def build_server(manager: SessionManager) -> MCPServer:
         "Send the next turn to a session (session/prompt); the agent keeps the conversation's context. Returns "
         "promptId immediately and the turn runs in the background - poll get_events. Fails with SESSION_BUSY "
         "while a previous turn runs. permissionMode / permissionPolicy override the session defaults for this "
-        "turn only (a different permissionMode restarts the agent and resumes the session). waitMs (0-60000, "
-        "default 0) waits for a quick turn; if it finishes in time, prompt.text is the final reply (delivered "
-        "here, so later get_events show deliveredAtSequence instead), otherwise state is running."))
+        "turn only (a different permissionMode restarts the agent and resumes the session); the response echoes "
+        "the effective permissionMode/permissionPolicy and adds permissionNote under policy 'operator'. "
+        "permissionPolicy only answers the agent's own permission requests - sandbox-allowed work needs none, "
+        "and an allow-once answer to an escalation widens that one call only, never the session mode. "
+        "waitMs (0-60000, default 0) waits for a quick turn; if it finishes in time, prompt.text is the final "
+        "reply (delivered here, so later get_events show textBytes + deliveredAtSequence instead; recover it "
+        "with get_events(includeText=true) or get_session(detail='full')), otherwise state is running."))
     async def prompt(sessionId: str, text: str, permissionMode: str | None = None,
                      permissionPolicy: str | None = None, waitMs: int = 0) -> str:
         return await _call(manager.prompt(sessionId, text, permission_mode=permissionMode,
@@ -126,27 +162,44 @@ def build_server(manager: SessionManager) -> MCPServer:
 
     @tool(description=(
         "Follow a session's current/last turn. view='final' (default): no event list, just prompt = {state, "
-        "stopReason, progress while running; when finished: text = the agent's final reply (its last message), "
-        "toolCalls = one line per tool call, gitSummary}. The final text is sent once: later calls give "
-        "textBytes + deliveredAtSequence; includeText=true (or re-polling from a cursor before the turn's end) "
-        "returns it again, and get_session(detail='full') always has it. waitMs (<=30000) long-polls: in "
-        "'final' until the turn ends or a permission question appears. view='messages': events as whole "
-        "messages and one line per tool call (no usage noise, no thoughts). view='full': raw ACP session/update "
-        "events (thoughts only with includeThoughts). Paging is the same in every view: pass nextSequence back "
-        "as afterSequence; limit<=500 events, maxBytes<=1 MiB per page. pendingPermissions lists open questions. "
-        "Full tool input/output: get_tool_call."))
+        "stopReason, permissionRequests, progress while running; when finished, permissionRequests stays and "
+        "the response that delivers the reply also carries text = the agent's final reply (its last message), "
+        "toolCalls = one line per tool call, toolCallIds = the matching ids, gitSummary; with "
+        "includeToolOutput=true also toolOutputs = bounded tool output excerpts}. The 'final' view does "
+        "not page events: nextSequence is always latestSequence and hasMore is always false. The final text is "
+        "delivered once: 'final' returns it in the first response that sees the turn finished and never repeats "
+        "it on later polls; 'messages'/'full' only on the page covering the turn's end, and retrying that page's "
+        "afterSequence republishes it (lost response). Later calls give textBytes + deliveredAtSequence and "
+        "permissionRequests; recover with includeText=true or get_session(detail='full'), which always has every "
+        "reply; a reply delivered by prompt(waitMs) is recovered the same way. waitMs (<=30000) long-polls: in "
+        "'final' until the turn "
+        "ends or a permission question appears. view='messages': events as whole messages and one line per tool "
+        "call (no usage noise, no thoughts). view='full': raw ACP session/update events (thoughts only with "
+        "includeThoughts). Only messages/full page through events: pass nextSequence back as afterSequence; "
+        "limit<=500 events, maxBytes<=1 MiB per page; text appears only on the page that covers the turn's end. "
+        "includeToolOutput=true adds prompt.toolOutputs for a finished turn: {toolCallId, title, status, output, "
+        "outputBytes, truncated}, 2 KiB per call and 8 KiB per response - the full record is get_tool_call. "
+        "pendingPermissions lists open permission requests while the turn waits: {permissionId, promptId, "
+        "toolCallId, tool, options}; tool is one line backfilled from this session's tool records (e.g. "
+        "'bash: rm -rf … → in_progress'), or 'tool' when nothing can be backfilled. Under 'operator' an escalation "
+        "to a wider sandbox waits there until resolve_permission; empty pendingPermissions and "
+        "permissionRequests=0 are normal. ACP has no exit-code field and dsh does not always print one: use "
+        "status, the stdout/stderr text, and get_tool_call as evidence, not an exit code."))
     async def get_events(sessionId: str, afterSequence: int = 0, view: str = "final", waitMs: int = 0,
-                         includeText: bool = False, limit: int = 100, maxBytes: int = 200_000,
-                         includeThoughts: bool = False, replyBytes: int = 65_536) -> str:
+                         includeText: bool = False, includeToolOutput: bool = False, limit: int = 100,
+                         maxBytes: int = 200_000, includeThoughts: bool = False,
+                         replyBytes: int = 65_536) -> str:
         return await _call(manager.get_events(sessionId, after_sequence=afterSequence, limit=limit,
                                               max_bytes=maxBytes, include_thoughts=includeThoughts,
                                               wait_ms=waitMs, reply_bytes=replyBytes, view=view,
-                                              include_text=includeText))
+                                              include_text=includeText,
+                                              include_tool_output=includeToolOutput))
 
     @tool(description=(
         "One tool call's full record: title, kind, status, input (rawInput) and output text, paged by bytes "
         "(offset / nextOffset, maxBytes<=256 KiB). toolCallId comes from view='messages' or 'full' events, or "
-        "get_session(detail='full')."))
+        "get_session(detail='full'). Use the full stdout/stderr here plus status as evidence: ACP has no "
+        "exit-code field and dsh does not always print one, so no tool promises an exit code."))
     async def get_tool_call(sessionId: str, toolCallId: str, offset: int = 0, maxBytes: int = 32_768) -> str:
         return await _call(manager.get_tool_call(sessionId, toolCallId, offset=offset, max_bytes=maxBytes))
 
@@ -161,10 +214,11 @@ def build_server(manager: SessionManager) -> MCPServer:
                                                  agent_id=agentId, cursor=cursor))
 
     @tool(description=(
-        "One session. detail='summary' (default): state, modes, recent prompts (state, preview, textBytes, "
-        "deliveredAtSequence) without reply text. detail='full': also every listed prompt's final reply text "
-        "(the reliable way to recover a reply), tool-call lines with toolCallIds, git summary, config options "
-        "(models), capabilities and agent process info."))
+        "One session. detail='summary' (default): state, permissionMode/permissionPolicy (plus permissionNote "
+        "under 'operator'), pendingPermissions ({permissionId, promptId, toolCallId, tool, options}) and recent "
+        "prompts (state, preview, textBytes, deliveredAtSequence) without reply text. detail='full': also every "
+        "listed prompt's final reply text (the reliable way to recover a reply), tool-call lines with toolCallIds, "
+        "git summary, config options (models), capabilities and agent process info."))
     async def get_session(sessionId: str, detail: str = "summary", promptsLimit: int = 10,
                           replyBytes: int = 65_536) -> str:
         return await _call(manager.get_session(sessionId, prompts_limit=promptsLimit, detail=detail,
@@ -174,7 +228,8 @@ def build_server(manager: SessionManager) -> MCPServer:
         "Attach a session to a live agent process: session/resume when the agent supports it (dsh), else "
         "session/load. Use it to reopen a closed session, after a gateway restart, or to adopt a session the "
         "agent persisted outside the gateway (then pass agentId and the session's cwd). prompt also re-attaches "
-        "automatically, so this is optional for known sessions."))
+        "automatically, so this is optional for known sessions. Returns the session summary, which includes "
+        "permissionNote under policy 'operator'."))
     async def load_session(sessionId: str, agentId: str | None = None, cwd: str | None = None,
                            permissionMode: str | None = None, permissionPolicy: str | None = None) -> str:
         return await _call(manager.load_session(sessionId, agent_id=agentId, cwd=cwd,
@@ -193,8 +248,10 @@ def build_server(manager: SessionManager) -> MCPServer:
     async def set_config_option(sessionId: str, configId: str, value: str) -> str:
         return await _call(manager.set_config_option(sessionId, configId, value))
 
-    @tool(description="Answer a pending permission request (policy 'operator') with one of its optionIds, "
-          "as listed in pendingPermissions.")
+    @tool(description="Answer a pending permission request (policy 'operator') with one of its optionIds from "
+          "the pendingPermissions entry (e.g. a sandbox escalation offering allow-once/reject-once). An "
+          "allow-once answer widens that one call only and does not change the session permissionMode; to change "
+          "the session use prompt(permissionMode=...).")
     async def resolve_permission(sessionId: str, permissionId: str, optionId: str) -> str:
         return _sync(manager.resolve_permission, sessionId, permissionId, optionId)
 

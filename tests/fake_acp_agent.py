@@ -2,7 +2,8 @@
 
 Env: FAKE_ACP_STATE (dir for persisted sessions), FAKE_ACP_CAPS (comma list of
 resume,load,list,close). A prompt is a script, one command per line:
-  say TEXT | msg TEXT | tool TITLE IN|OUT | think TEXT | recall | sleep S | hang S | perm KIND | write FILE TEXT
+  say TEXT | msg TEXT | tool TITLE IN|OUT | think TEXT | recall | sleep S | hang S | perm KIND |
+  escalate TITLE IN|OUT | write FILE TEXT
   big N | tool_big N | crash | fail | env NAME | model
 """
 import asyncio
@@ -107,6 +108,20 @@ async def run_prompt(sid, text):
                 {"optionId": "reject", "name": "Reject", "kind": "reject_once"}]})
             o = r.get("outcome", {})
             say(sid, mid, "permission: " + (o.get("optionId") if o.get("outcome") == "selected" else "cancelled"))
+        elif cmd == "escalate":  # dsh-acp-style sandbox escalation ask: only a toolCallId, allow-once/reject-once
+            title, _, io = rest.partition(" ")
+            inp, _, outp = io.partition("|")
+            tid = "tc-" + uuid.uuid4().hex[:6]
+            update(sid, {"sessionUpdate": "tool_call", "toolCallId": tid, "title": title, "kind": "execute",
+                         "status": "in_progress", "rawInput": {"command": inp}})
+            r = await client_request("session/request_permission", {
+                "sessionId": sid, "toolCall": {"toolCallId": tid},
+                "options": [{"optionId": "allow-once", "name": "Allow once", "kind": "allow_once"},
+                            {"optionId": "reject-once", "name": "Reject", "kind": "reject_once"}]})
+            o = r.get("outcome", {})
+            update(sid, {"sessionUpdate": "tool_call_update", "toolCallId": tid, "status": "completed",
+                         "content": [{"type": "content", "content": {"type": "text", "text": outp or "ok"}}]})
+            say(sid, mid, "escalate: " + (o.get("optionId") if o.get("outcome") == "selected" else "cancelled"))
         elif cmd == "write":
             fn, _, t = rest.partition(" ")
             with open(os.path.join(s["cwd"], fn), "w") as f:
