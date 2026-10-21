@@ -46,6 +46,8 @@ tunnel-client 用 `--mcp-server-url http://127.0.0.1:8765/mcp` 连过来。部�
 
 限制：dsh-acp 不透传申请的模式和 `justification`，网关不能展示“申请更宽沙箱及原因”。
 
+部署可以选择启用 dsh 的实验性 **Auto review**（`dsh --profile acp-auto` + `permissionMode=auto` + `permissionPolicy=operator`）：执行前由模型逐调用审查，低风险直接以 full access 运行，medium/high 被拒时挂起问人。安装与配置见 [docs/auto-review.md](docs/auto-review.md)；这是实验功能，会多花模型调用，也可能误放行/误拒绝。
+
 ## 许可证
 
 [MIT](LICENSE)

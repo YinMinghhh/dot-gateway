@@ -46,8 +46,9 @@ get_events(includeToolOutput=true) adds prompt.toolOutputs for a finished turn: 
 stdout/stderr and larger output: get_tool_call(toolCallId), which has the full input and output.
 ACP has no exit-code field and dsh does not always print one: use status, the stdout/stderr text, and
 get_tool_call as evidence, not an exit code.
-Permissions have two layers. permissionMode is the agent's own sandbox (dsh: read-only | workspace-write |
-danger-full-access); it is not an approval switch. permissionPolicy (read_only | allow_all | deny_all |
+Permissions have two layers. permissionMode is the agent's own sandbox (built-in dsh: read-only |
+workspace-write | danger-full-access; a deployment may advertise extra modes such as 'auto', see
+list_agents); it is not an approval switch. permissionPolicy (read_only | allow_all | deny_all |
 operator; default read_only) only decides how the gateway answers permission requests the agent sends itself:
 read_only auto-rejects non-read requests, allow_all auto-allows, deny_all auto-rejects, and operator holds a
 request in pendingPermissions until resolve_permission. Work the sandbox already allows needs no approval, so
@@ -58,6 +59,12 @@ that call (workspace-write/read-only presets ask, danger-full-access preset neve
 into ACP session/request_permission. Under operator such a request waits in pendingPermissions until
 resolve_permission; an allow-once answer widens that one call only and does not change the session
 permissionMode (change the session with prompt(permissionMode=...); the agent restarts and resumes).
+Some deployments add an 'auto' permissionMode (dsh Auto review): Auto review checks every supported tool call
+before it runs. Ordinary project-local work executes with full host access; medium/high-risk calls are denied
+and then ask through the same session/request_permission path. Pair it with permissionPolicy=operator so those
+questions reach you in pendingPermissions; read_only would answer them without asking. Auto review is a dsh
+experimental feature, costs extra model calls, and is enabled by the gateway deployment's agent config, not by
+an ACP call.
 pendingPermissions entries are {permissionId, promptId, toolCallId, tool, options}: dsh-acp sends only the
 toolCallId, and the gateway backfills title/kind/status/input from this session's tool records into `tool`, one
 line like 'bash: rm -rf … → in_progress' ('tool' if nothing can be backfilled). Limit: dsh-acp does not forward
@@ -128,8 +135,9 @@ def build_server(manager: SessionManager) -> MCPServer:
     @tool(description=(
         "Start a new ACP session (session/new) for agent `agentId` (default dsh) in absolute directory `cwd`. "
         "Returns sessionId (and promptId if `prompt` was given) at once; the first turn runs in the background - "
-        "poll get_events. permissionMode (dsh: read-only | workspace-write | danger-full-access; default "
-        f"workspace-write) is the agent's own sandbox. permissionPolicy ({policies}; default read_only) only "
+        "poll get_events. permissionMode values and the default are listed by list_agents for the chosen agent "
+        "(built-in dsh: read-only | workspace-write | danger-full-access; a deployment may add e.g. auto for "
+        f"Auto review). permissionPolicy ({policies}; default read_only) only "
         "decides how the gateway answers permission requests the agent sends itself; sandbox-allowed work needs "
         "no approval, so an empty pendingPermissions is normal, and under 'operator' the returned summary "
         "includes permissionNote. `model` (e.g. deepseek-v4-pro) or `config` "

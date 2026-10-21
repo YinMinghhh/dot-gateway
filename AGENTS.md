@@ -88,7 +88,7 @@ scripts/start.sh --port 18765          # 本地试跑时换一个端口，不要
 
 网关的权限有两层，各管一件事：`permissionMode` 是 agent 自己的沙箱；`permissionPolicy` 只决定网关怎么回答 agent **自己发起**的 `session/request_permission`。网关不拦截工具调用本身——沙箱允许的操作直接执行，不需要任何审批，所以“没有挂起项”通常是正常的。
 
-1. **`permissionMode`：agent 自己的沙箱。** dsh 的取值是 `read-only`、`workspace-write`（默认）、`danger-full-access`，通过 `DSH_PERMISSION_MODE` 生效。`start_session` 里设的是会话默认值，`prompt` 里设的只对这一轮生效，`load_session` 也能改会话默认值。模式改了，网关会重启 agent，再用 `session/resume` 接回会话。
+1. **`permissionMode`：agent 自己的沙箱。** 内置 dsh 的取值是 `read-only`、`workspace-write`（默认）、`danger-full-access`，通过 `DSH_PERMISSION_MODE` 生效；部署可以追加模式（例如 Auto review 的 `auto`，见 [docs/auto-review.md](docs/auto-review.md)）。`start_session` 里设的是会话默认值，`prompt` 里设的只对这一轮生效，`load_session` 也能改会话默认值。模式改了，网关会重启 agent，再用 `session/resume` 接回会话。
 2. **`permissionPolicy`：网关怎么回答这些请求。** 命名照 acp-mcp：
    - `read_only`（默认）：`read`、`search`、`fetch`、`think` 类的请求选 allow，其他都选 reject。dsh-acp 的升级请求只带 `toolCallId`、不带 `kind`，网关按非读类处理，所以默认策略下这类升级会被自动拒绝；
    - `allow_all`：全部选 allow；
@@ -103,7 +103,9 @@ scripts/start.sh --port 18765          # 本地试跑时换一个端口，不要
 
 **allow-once 只放宽该次调用**，不改变会话的 `permissionMode`。要整个会话换档，用 `prompt(permissionMode=...)`（网关会重启 agent 并 `session/resume`）。
 
-**限制：** dsh-acp 目前不把申请的模式和 `justification` 透传给 ACP，所以网关只能回填工具信息，不能展示“申请 `danger-full-access` 及原因”。
+**Auto review（可选部署）。** dsh 自带一个实验性的 Auto review 层：profile 里挂上后权限预设多一个 `auto`（full access + ask），每个受支持的工具调用执行前让当前模型先审一遍。低风险调用直接以 full access 执行；medium/high 风险被拒绝时走 approval `ask`，由 dsh-acp 桥接成 ACP 权限请求。网关要暴露它，需要在 dsh agent 的 `permission_modes` 里加 `auto`（把 args 指向 `--profile acp-auto`），并建议把 `permissionPolicy` 设为 `operator`——否则这类 ask 会被默认的 `read_only` 自动拒绝。Auto review 是实验功能：多花模型调用、可能误放行/误拒绝，只能在 dsh 侧 profile 启用，不是网关的 `permissionPolicy` 取值。安装、配置和回退见 [docs/auto-review.md](docs/auto-review.md)。
+
+**限制：** dsh-acp 目前不把申请的模式和 `justification` 透传给 ACP，所以网关只能回填工具信息，不能展示“申请 `danger-full-access` 及原因”；Auto review 的审查理由同样没有 ACP 字段可透传。
 
 **回显。** `permissionPolicy` 为 `operator` 时，`prompt` 响应、`start_session` / `load_session` / `get_session(detail="summary")` 的 summary 都带 `permissionNote`（就是上面这些语义的固定说明文本）。`prompt` 响应还回显这一轮实际生效的 `permissionMode` / `permissionPolicy`；这一轮 agent 发过几次权限请求，看 final 视图的 `permissionRequests`。
 

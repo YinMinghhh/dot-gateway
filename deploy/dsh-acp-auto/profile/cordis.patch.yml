@@ -1,0 +1,5 @@
+# Select dsh's Auto review permission preset for ACP sessions when DSH_AUTO_REVIEW=1.
+# Mounted after @deepseek-ai/dsh-experimental-auto-review, so the Auto preset is live.
+- insert:
+    - id: auto-select
+      name: './auto-select.mjs'

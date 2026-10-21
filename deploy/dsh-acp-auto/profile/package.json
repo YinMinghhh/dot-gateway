@@ -1,0 +1,14 @@
+{
+  "name": "dsh-profile-acp-auto",
+  "private": true,
+  "dependencies": {},
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-acp-app",
+        "@deepseek-ai/dsh-experimental-auto-review"
+      ]
+    }
+  }
+}
