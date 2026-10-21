@@ -64,7 +64,8 @@ before it runs. Ordinary project-local work executes with full host access; medi
 and then ask through the same session/request_permission path. Pair it with permissionPolicy=operator so those
 questions reach you in pendingPermissions; read_only would answer them without asking. Auto review is a dsh
 experimental feature, costs extra model calls, and is enabled by the gateway deployment's agent config, not by
-an ACP call.
+an ACP call. When list_agents advertises an 'auto' mode, prefer it for tasks that write or execute, and keep
+permissionPolicy=operator so Auto review questions reach you.
 pendingPermissions entries are {permissionId, promptId, toolCallId, tool, options}: dsh-acp sends only the
 toolCallId, and the gateway backfills title/kind/status/input from this session's tool records into `tool`, one
 line like 'bash: rm -rf … → in_progress' ('tool' if nothing can be backfilled). Limit: dsh-acp does not forward
