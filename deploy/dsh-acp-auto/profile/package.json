@@ -6,8 +6,7 @@
     "profile": {
       "bundles": [
         "@deepseek-ai/dsh-base",
-        "@deepseek-ai/dsh-acp-app",
-        "@deepseek-ai/dsh-experimental-auto-review"
+        "@deepseek-ai/dsh-acp-app"
       ]
     }
   }

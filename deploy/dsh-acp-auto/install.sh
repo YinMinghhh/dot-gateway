@@ -14,5 +14,7 @@ DEST="$DSH_HOME/profiles/acp-auto"
 mkdir -p "$DEST"
 cp "$HERE/profile/package.json" "$HERE/profile/cordis.yml" "$HERE/profile/cordis.patch.yml" \
    "$HERE/profile/auto-select.mjs" "$DEST/"
+rm -rf "$DEST/vendor"
+cp -R "$HERE/profile/vendor" "$DEST/vendor"
 printf 'installed %s\n' "$DEST"
 printf 'Next: point the gateway dsh agent at --profile acp-auto and advertise an "auto" permissionMode.\n'

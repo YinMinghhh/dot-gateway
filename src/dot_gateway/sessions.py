@@ -113,6 +113,8 @@ class SessionManager:
         self.registry = registry
         self.root = Path(config.state_dir) / "sessions"
         self.root.mkdir(parents=True, exist_ok=True)
+        # Audit side-channel written by the vendored Auto review plugin; merged into tool review fields.
+        self.auto_review_audit_dir = Path(config.state_dir) / "auto-review-audit"
         self._records: dict[str, dict[str, Any]] = {}
         self._logs: dict[str, EventLog] = {}
         self._rt: dict[str, Runtime] = {}
@@ -233,6 +235,8 @@ class SessionManager:
     async def _spawn(self, agent: AgentDefinition, cwd: str, mode: str | None, stderr_path: Path) -> Runtime:
         rt = Runtime(agent=agent, mode=mode)
         argv, env = agent.launch(mode, self._base_env())
+        if env.get("DSH_AUTO_REVIEW") == "1":
+            env["DOT_GATEWAY_AUTO_REVIEW_AUDIT_DIR"] = str(self.auto_review_audit_dir)
         rt.conn = AcpConnection(
             argv,
             cwd,
@@ -561,6 +565,8 @@ class SessionManager:
             return None
         v: dict[str, Any] = {"prompt_id": pr["prompt_id"], "state": pr["state"], "stop_reason": pr.get("stop_reason"),
                              "permission_requests": int(pr.get("permission_requests") or 0)}
+        if pr.get("permission_mode") == "auto":
+            v["review_mode"] = "auto"
         if pr.get("error"):
             v["error"] = pr["error"]
         if pr["state"] == "running":
@@ -588,6 +594,10 @@ class SessionManager:
             if tools:
                 v["tool_calls"] = [_tool_line(t) for t in tools]
                 v["tool_call_ids"] = [t.get("tool_call_id") for t in tools]
+                reviews = self._auto_reviews(rec)
+                tool_reviews = [reviews[tid] for tid in v["tool_call_ids"] if tid in reviews]
+                if tool_reviews:
+                    v["tool_reviews"] = tool_reviews
             if pr.get("git_summary"):
                 v["git_summary"] = pr["git_summary"]
             if delivered is None and deliver:
@@ -627,6 +637,29 @@ class SessionManager:
             used += got
         return out
 
+    def _auto_reviews(self, rec: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        """Reviewer decisions from the Auto review audit JSONL (best-effort side-channel)."""
+        acp_sid = str(rec.get("acp_session_id") or rec["session_id"])
+        if not _SID_RE.match(acp_sid):
+            return {}
+        path = self.auto_review_audit_dir / f"{acp_sid}.jsonl"
+        try:
+            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            return {}
+        out: dict[str, dict[str, Any]] = {}
+        for line in lines:
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            tid = obj.get("toolCallId")
+            if tid is None:
+                continue
+            value, _ = clip(obj, 2048)
+            out[str(tid)] = value
+        return out
+
     def _summary(self, rec: dict[str, Any]) -> dict[str, Any]:
         sid = rec["session_id"]
         view = {
@@ -638,12 +671,15 @@ class SessionManager:
             "permission_mode": rec.get("permission_mode"),
             "permission_policy": rec.get("permission_policy"),
         }
+        if view["permission_mode"] == "auto":
+            view["review_mode"] = "auto"
         if view["permission_policy"] == "operator":
             view["permission_note"] = OPERATOR_PERMISSION_NOTE
         return view
 
     def _pending(self, rec: dict[str, Any]) -> list[dict[str, Any]]:
         sid = rec["session_id"]
+        reviews = self._auto_reviews(rec)
         out = []
         for info in rec.get("pending_permissions") or []:
             tc = dict(info.get("toolCall") or {})
@@ -683,6 +719,15 @@ class SessionManager:
                     entry["sandbox_permissions"] = str(raw["sandbox_permissions"])
                 if raw.get("justification") is not None:
                     entry["justification"] = str(raw["justification"])
+            review = reviews.get(str(tcid)) if tcid else None
+            if review is not None:
+                entry["review"] = review
+            if review is not None and review.get("decision") == "ask":
+                entry["approval_source"] = "auto-review"
+            elif isinstance(raw, dict) and raw.get("sandbox_permissions"):
+                entry["approval_source"] = "sandbox-escalation"
+            else:
+                entry["approval_source"] = "agent"
             out.append(entry)
         return out
 
@@ -1124,7 +1169,7 @@ class SessionManager:
 
     async def get_tool_call(self, session_id: str, tool_call_id: str, offset: int = 0,
                             max_bytes: int = DEFAULT_TOOL_BYTES) -> dict[str, Any]:
-        self._rec(session_id)
+        rec = self._rec(session_id)
         path = self._tool_path(session_id, tool_call_id)
         if not path.exists():
             raise SessionError("NOT_FOUND", f"no tool call {tool_call_id!r} recorded in this session")
@@ -1138,6 +1183,7 @@ class SessionManager:
             "session_id": session_id,
             "tool_call_id": full.get("toolCallId", tool_call_id),
             "prompt_id": full.get("promptId"),
+            "review": self._auto_reviews(rec).get(str(tool_call_id)),
             "title": full.get("title"),
             "kind": full.get("kind"),
             "status": full.get("status"),
@@ -1266,6 +1312,7 @@ class SessionManager:
         if pending:
             view["pending_permissions"] = pending
         items = []
+        reviews = self._auto_reviews(rec)
         rb = max(0, min(int(reply_bytes), MAX_REPLY_BYTES))
         for p in prompts[-n:]:
             it = {"prompt_id": p["prompt_id"], "state": p["state"], "stop_reason": p.get("stop_reason"),
@@ -1280,7 +1327,9 @@ class SessionManager:
             if detail == "full":
                 raw = (p.get("reply_text") or "").encode()
                 it.update(text=raw[:rb].decode("utf-8", errors="ignore"),
-                          tool_calls=[{"tool_call_id": t["tool_call_id"], "line": _tool_line(t)}
+                          tool_calls=[{"tool_call_id": t["tool_call_id"], "line": _tool_line(t),
+                                       **({"review": reviews[str(t["tool_call_id"])]}
+                                          if str(t["tool_call_id"]) in reviews else {})}
                                       for t in self._tool_summaries(p)],
                           git_summary=p.get("git_summary"), permission_mode=p.get("permission_mode"),
                           permission_policy=p.get("permission_policy"), resumed=p.get("resumed"),

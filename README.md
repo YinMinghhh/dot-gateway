@@ -31,8 +31,8 @@ tunnel-client 用 `--mcp-server-url http://127.0.0.1:8765/mcp` 连过来。部�
 |---|---|
 | `start_session(cwd, prompt?)` | 开一个会话；带 prompt 时发出去就返回，不等跑完 |
 | `prompt(sessionId, text)` | 同一个会话的下一轮；一轮没结束再调会返回 `SESSION_BUSY`。响应回显这一轮实际生效的 `permissionMode`/`permissionPolicy`，`operator` 下另带 `permissionNote` |
-| `get_events(sessionId, view?, includeToolOutput?)` | 轮询结果。默认 `view=final`：只给状态，这一轮结束时给一次最终答复，该视图不分页事件；`messages` 给合并后的整条消息和工具调用，`full` 给原始事件，这两个视图才按 `afterSequence` 翻页；`includeToolOutput=true` 附带有界的工具输出摘录；等审批时带 `pendingPermissions`（含 `toolCallId`、回填的一行工具摘要、完整命令，以及 `sandboxPermissions`/justification（如有）） |
-| `get_tool_call(sessionId, toolCallId)` | 某次工具调用的完整输入和输出 |
+| `get_events(sessionId, view?, includeToolOutput?)` | 轮询结果。默认 `view=final`：只给状态，这一轮结束时给一次最终答复，该视图不分页事件；`messages` 给合并后的整条消息和工具调用，`full` 给原始事件，这两个视图才按 `afterSequence` 翻页；`includeToolOutput=true` 附带有界的工具输出摘录；等审批时带 `pendingPermissions`（含 `toolCallId`、回填的一行工具摘要、完整命令、`sandboxPermissions`/justification（如有）、`approvalSource` 和 Auto review 的 `review`）；Auto review 会话还带 `reviewMode`/`toolReviews` |
+| `get_tool_call(sessionId, toolCallId)` | 某次工具调用的完整输入和输出；有 Auto review audit 时附 `review` |
 | `get_session` / `list_sessions` | 会话概况；`detail=full` 带每一轮的完整答复 |
 | `load_session` | 接回会话（dsh 用 `session/resume`） |
 | `cancel_prompt` / `close_session` | 中断这一轮 / 结束会话 |
@@ -46,7 +46,7 @@ tunnel-client 用 `--mcp-server-url http://127.0.0.1:8765/mcp` 连过来。部�
 
 限制：dsh-acp 的 ACP 请求只带 `toolCallId`，申请的模式/理由只能从工具输入回填（`command`、`sandboxPermissions`、`justification`）；Auto review 的审查理由没有 ACP 字段，网关看不到。
 
-部署可以选择启用 dsh 的实验性 **Auto review**（`dsh --profile acp-auto` + `permissionMode=auto` + `permissionPolicy=operator`）：执行前由模型逐调用审查，低风险直接以 full access 运行，medium/high 被拒时挂起问人。安装与配置见 [docs/auto-review.md](docs/auto-review.md)；这是实验功能，会多花模型调用，也可能误放行/误拒绝。
+部署可以选择启用 dsh 的实验性 **Auto review**（`dsh --profile acp-auto` + `permissionMode=auto` + `permissionPolicy=operator`）：执行前由模型逐调用审查，低风险直接以 full access 运行，medium/high 被拒时挂起问人。安装与配置见 [docs/auto-review.md](docs/auto-review.md)；vendored profile 会把 reviewer 的 decision/risk/reason 写到本地 audit 旁路，网关在 `toolReviews`/`get_tool_call.review` 里返回；`scripts/test_auto_review.py` 提供 allow/ask/deny 的确定性测试入口。这是实验功能，会多花模型调用，也可能误放行/误拒绝。
 
 ## 许可证
 

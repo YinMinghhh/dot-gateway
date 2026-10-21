@@ -645,6 +645,17 @@ async def test_operator_note_and_escalation_request_enrichment(manager, repo):
     assert perm["sandbox_permissions"] == "danger-full-access"
     assert perm["justification"] == "permission transport test"
     assert {o["optionId"] for o in perm["options"]} == {"allow-once", "reject-once"}
+    assert perm["approval_source"] == "sandbox-escalation"
+    # An Auto review ask audit record flips the source and carries the reviewer decision.
+    audit_dir = manager.config.state_dir / "auto-review-audit"
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    (audit_dir / f"{sid}.jsonl").write_text(json.dumps({
+        "toolCallId": perm["tool_call_id"], "decision": "ask", "risk": "medium",
+        "reason": "simulated reviewer ask", "source": "auto-review", "executedSandbox": None,
+        "policy": "test", "reviewedAt": "2026-01-01T00:00:00Z"}) + "\n")
+    pend2 = await wait_for(lambda: _pending(manager, sid))
+    assert pend2[0]["approval_source"] == "auto-review"
+    assert pend2[0]["review"]["decision"] == "ask"
     r = manager.resolve_permission(sid, perm["permission_id"], "allow-once")
     assert r["resolved"]["option_id"] == "allow-once"
     p = await wait_done(manager, sid)
@@ -665,3 +676,25 @@ async def test_prompt_response_echoes_effective_permission_config(manager, repo)
     r2 = await manager.prompt(sid, "say again", permission_policy="operator")
     assert r2["permission_policy"] == "operator" and "permission_note" in r2
     assert (await wait_done(manager, sid))["text"] == "again"
+
+
+async def test_auto_review_audit_is_exposed(manager, repo):
+    s = await manager.start_session(str(repo), agent_id="fake",
+                                    prompt="tool bash cat README|hi\nmsg done")
+    sid = s["session_id"]
+    await wait_done(manager, sid)
+    full = await manager.get_session(sid, detail="full")
+    tid = full["prompts"][-1]["tool_calls"][0]["tool_call_id"]
+    audit_dir = manager.config.state_dir / "auto-review-audit"
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    record = {"toolCallId": tid, "tool": "bash", "decision": "allow", "risk": "low", "reason": None,
+              "source": "auto-review", "executedSandbox": "danger-full-access",
+              "policy": "test", "reviewedAt": "2026-01-01T00:00:00Z"}
+    (audit_dir / f"{sid}.jsonl").write_text(json.dumps(record) + "\n")
+    r = await manager.get_events(sid, include_text=True)
+    reviews = r["prompt"]["tool_reviews"]
+    assert reviews[0]["decision"] == "allow" and reviews[0]["executedSandbox"] == "danger-full-access"
+    tc = await manager.get_tool_call(sid, tid)
+    assert tc["review"]["source"] == "auto-review"
+    full2 = await manager.get_session(sid, detail="full")
+    assert full2["prompts"][-1]["tool_calls"][0]["review"]["decision"] == "allow"

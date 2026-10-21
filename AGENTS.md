@@ -22,6 +22,7 @@
 | `tests/` | 单元测试和 MCP 测试，用 `tests/fake_acp_agent.py` 当假 agent |
 | `scripts/start.sh` | 前台启动（LaunchAgent 也用它） |
 | `scripts/smoke_dsh.py` | 真实 dsh 的验收测试（会花一点 DeepSeek 费用） |
+| `scripts/test_auto_review.py` | Auto review allow/ask/deny 的确定性验收（真实 dsh + 脚本化 reviewer，会花少量模型调用） |
 | `docs/local.dot-gateway.plist.example` | LaunchAgent 示例 |
 
 ## 开发
@@ -30,6 +31,7 @@
 uv sync
 uv run pytest -q                       # 全部单元测试和 MCP 测试，不花钱
 uv run python scripts/smoke_dsh.py     # 真实 dsh：多轮对话、网关完全停止后续接、忙碌、取消、崩溃
+uv run python scripts/test_auto_review.py  # 真实 dsh + 脚本化 reviewer：验证 Auto review allow/ask/deny（会花少量模型调用）
 scripts/start.sh --port 18765          # 本地试跑时换一个端口，不要占用正式服务的 8765
 ```
 
@@ -46,7 +48,7 @@ scripts/start.sh --port 18765          # 本地试跑时换一个端口，不要
 - `get_events(view=...)`：
   - `final`（默认）：不返回事件列表，只返回 `prompt`。这个视图**不按事件分页**：`nextSequence` 恒等于 `latestSequence`，`hasMore` 恒为 `false`，按固定间隔重发即可；交付后再查不会重复，即使游标不变。
     - 运行中时，`prompt` 里有 `progress`：工具调用次数、最近一次工具调用的一行摘要、消息数。
-    - 结束后，`permissionRequests`（本轮 ACP 权限请求次数，`0` 表示 agent 一次都没问）始终给；交付答复的响应里还给 `text`（这一轮**最后一条** agent 消息，中间的过渡话不算）、`toolCalls`（每次工具调用一行，例如 `bash: ls -la → completed`）、与 `toolCalls` 等长同序的 `toolCallIds` 和 `gitSummary`。
+    - 结束后，`permissionRequests`（本轮 ACP 权限请求次数，`0` 表示 agent 一次都没问）始终给；交付答复的响应里还给 `text`（这一轮**最后一条** agent 消息，中间的过渡话不算）、`toolCalls`（每次工具调用一行，例如 `bash: ls -la → completed`）、与 `toolCalls` 等长同序的 `toolCallIds` 和 `gitSummary`；Auto review 会话还带 `reviewMode` 和 `toolReviews`（每个有审查记录的调用：`decision`/`risk`/`reason`/`source`/`executedSandbox`/`reviewedAt`/`policy`）。
     - `waitMs`（最大 30000）会一直等到这一轮结束或出现权限请求。
     - `includeToolOutput=true` 时，已结束的 `prompt`（任何视图都适用）还会给 `toolOutputs`：`[{toolCallId, title, status, output, outputBytes, truncated}]`。`output` 是截断后的预览（单条最多 2 KiB，整个响应最多 8 KiB），`outputBytes` 是完整输出的字节数，`truncated` 表示预览被截断。完整输入输出仍用 `get_tool_call`。
   - `messages`：同一条消息的多个分片合并成一整条；每次工具调用一行，带 `toolCallId`；不含 `usage_update` 这类噪声，也不含思考内容（除非 `includeThoughts`）。如果这一页的 `prompt.text` 带了最终答复（只有覆盖轮末的那一页会带），对应那条消息只标 `textInPrompt: true`，不重复正文。
@@ -59,9 +61,9 @@ scripts/start.sh --port 18765          # 本地试跑时换一个端口，不要
   - `prompt(waitMs=...)` 在调用里直接交付的答复，用 `get_events(includeText=true)` 或 `get_session(detail="full")` 恢复。
   
   投递状态保存在 `session.json` 里，网关重启后也不会丢；`messages` / `full` 的同游标恢复用的是交付时记下的游标。升级前已经交付过、但没有记录游标的旧轮次，用 `includeText=true` 或 `get_session(detail="full")` 恢复。
-- **等审批时看 `pendingPermissions`。** `get_events`（任何视图）和 `get_session` 在轮次等待权限回答时会带 `pendingPermissions`：`[{permissionId, promptId, toolCallId, tool, title?, kind?, status?, command?, commandBytes?, commandTruncated?, sandboxPermissions?, justification?, options}]`。dsh-acp 的请求只带 `toolCallId`，网关从本会话工具记录回填一行 `tool`（例如 `bash: rm -rf … → in_progress`）、完整 `command`（上限 16 KiB）以及能回填到的 `sandboxPermissions`/`justification`；`options` 里的 `optionId` 交给 `resolve_permission`。
-- `get_session(detail="summary")` 不带答复正文；summary 和 `start_session` / `load_session` 一样带 `permissionMode`、`permissionPolicy`、`permissionNote`（operator 时）和 `pendingPermissions`。`detail="full"` 会带上每一轮的答复、工具调用行和 `toolCallId`、git 摘要、配置项（可选模型）、agent 能力和进程信息。
-- `get_tool_call(sessionId, toolCallId, offset, maxBytes)` 返回某次工具调用的完整输入和输出，输出按字节分页（每页最大 256 KiB）。这份完整记录存在 `tool-calls/<id>.json`，每个字符串最多 1 MiB。事件日志里的字符串只保留到 8 KiB。
+- **等审批时看 `pendingPermissions`。** `get_events`（任何视图）和 `get_session` 在轮次等待权限回答时会带 `pendingPermissions`：`[{permissionId, promptId, toolCallId, tool, title?, kind?, status?, command?, commandBytes?, commandTruncated?, sandboxPermissions?, justification?, approvalSource?, review?, options}]`。dsh-acp 的请求只带 `toolCallId`，网关从本会话工具记录回填一行 `tool`（例如 `bash: rm -rf … → in_progress`）、完整 `command`（上限 16 KiB）以及能回填到的 `sandboxPermissions`/`justification`；Auto review 的 ask 还会从本地 audit 旁路带 `review` 和 `approvalSource: "auto-review"`，沙箱升级标 `"sandbox-escalation"`，其他标 `"agent"`；`options` 里的 `optionId` 交给 `resolve_permission`。
+- `get_session(detail="summary")` 不带答复正文；summary 和 `start_session` / `load_session` 一样带 `permissionMode`、`permissionPolicy`、`permissionNote`（operator 时）和 `pendingPermissions`。`detail="full"` 会带上每一轮的答复、工具调用行和 `toolCallId`（有 Auto review audit 时附 `review`）、git 摘要、配置项（可选模型）、agent 能力和进程信息。
+- `get_tool_call(sessionId, toolCallId, offset, maxBytes)` 返回某次工具调用的完整输入和输出，输出按字节分页（每页最大 256 KiB）。这份完整记录存在 `tool-calls/<id>.json`，每个字符串最多 1 MiB。事件日志里的字符串只保留到 8 KiB。有 Auto review audit 时返回值还带 `review`（decision/risk/reason/source/executedSandbox）。
 - **拿不到退出码。** ACP 的 `tool_call_update` 没有独立的 exit code 字段，dsh 的成功命令输出里也可能没有退出码标记。判断成败看 `status`（例如 `completed` / `failed`）、`toolOutputs` 或事件里的 stdout/stderr 文本，以及 `get_tool_call` 的完整输出；文档和工具描述都不承诺退出码。
 - `list_sessions` 每个会话只给状态和最近一轮的预览（200 字），不带答复。`close_session` 只返回 `{sessionId, state, note}`。`cancel_prompt` 只返回这一轮的状态。
 
@@ -99,13 +101,15 @@ scripts/start.sh --port 18765          # 本地试跑时换一个端口，不要
 
 **空 `pendingPermissions` 和 0 条 `permissionRequests` 通常是正常的。** 实测 dsh 0.2.1-rc.2 在 `workspace-write` 下创建/编辑文件、执行 shell 命令都不会发权限请求，所以默认的 `read_only` 挡不住这类操作，`operator` 也没有东西可挂；没有挂起项不代表策略没生效。
 
-**`pendingPermissions` 的条目**是 `{permissionId, promptId, toolCallId, tool, title?, kind?, status?, command?, commandBytes?, commandTruncated?, sandboxPermissions?, justification?, options}`。dsh-acp 的请求只带 `toolCallId`，网关会从本会话的工具记录回填 title/kind/status/rawInput：`tool` 是一行摘要；`command` 是完整命令（上限 16 KiB，`commandBytes`/`commandTruncated` 标明是否截断）；`sandboxPermissions` 是 agent 单次扩权申请（如有）；`justification` 是模型给的理由（如有）。回填不到时只有 `tool`。
+**`pendingPermissions` 的条目**是 `{permissionId, promptId, toolCallId, tool, title?, kind?, status?, command?, commandBytes?, commandTruncated?, sandboxPermissions?, justification?, approvalSource?, review?, options}`。dsh-acp 的请求只带 `toolCallId`，网关会从本会话的工具记录回填 title/kind/status/rawInput：`tool` 是一行摘要；`command` 是完整命令（上限 16 KiB，`commandBytes`/`commandTruncated` 标明是否截断）；`sandboxPermissions` 是 agent 单次扩权申请（如有）；`justification` 是模型给的理由（如有）；Auto review ask 另有 `review` 和 `approvalSource: "auto-review"`。回填不到时只有 `tool`。
 
 **allow-once 只放宽该次调用**，不改变会话的 `permissionMode`。要整个会话换档，用 `prompt(permissionMode=...)`（网关会重启 agent 并 `session/resume`）。
 
-**Auto review（可选部署）。** dsh 自带一个实验性的 Auto review 层：profile 里挂上后权限预设多一个 `auto`（full access + ask），每个受支持的工具调用执行前让当前模型先审一遍。低风险调用直接以 full access 执行；medium/high 风险被拒绝时走 approval `ask`，由 dsh-acp 桥接成 ACP 权限请求。网关要暴露它，需要在 dsh agent 的 `permission_modes` 里加 `auto`（把 args 指向 `--profile acp-auto`），并建议把 `permissionPolicy` 设为 `operator`——否则这类 ask 会被默认的 `read_only` 自动拒绝。Auto review 是实验功能：多花模型调用、可能误放行/误拒绝，只能在 dsh 侧 profile 启用，不是网关的 `permissionPolicy` 取值。安装、配置和回退见 [docs/auto-review.md](docs/auto-review.md)。
+**Auto review（可选部署）。** dsh 自带一个实验性的 Auto review 层：profile 里挂上后权限预设多一个 `auto`（full access + ask），每个受支持的工具调用执行前让当前模型先审一遍。低风险调用直接以 full access 执行；medium/high 风险被拒绝时走 approval `ask`，由 dsh-acp 桥接成 ACP 权限请求。网关要暴露它，需要在 dsh agent 的 `permission_modes` 里加 `auto`（把 args 指向 `--profile acp-auto`），并建议把 `permissionPolicy` 设为 `operator`——否则这类 ask 会被默认的 `read_only` 自动拒绝。
 
-**限制：** dsh-acp 的 ACP 请求本身只带 `toolCallId`，所以申请的模式/理由只能从本会话工具输入里回填；Auto review 的审查理由不是工具输入的一部分，ACP 也没有对应字段，`pendingPermissions` 里看不到 reviewer reason。
+本仓库的 profile 使用一份 vendored auto-review 插件：reviewer 决定会额外写本地 audit JSONL（`<state_dir>/auto-review-audit/<acpSessionId>.jsonl`），网关读取后把 `reviewMode`、`toolReviews`、`tool_call.review`、`pendingPermissions.review/approvalSource` 返回给调用方；allow 决策按 dsh 协议没有文本 reason（只有 risk/policy），deny/ask 有 reviewer reason。插件还支持 `DSH_AUTO_REVIEW_TEST=allow|ask|deny|by-command` 的确定性测试模式（不要在生产开启），并强化了 REVIEW_POLICY：显式人类约束（不许删除、限定写入目录等）优先于 session-created cleanup。`uv run python scripts/test_auto_review.py` 会走真实 dsh + 脚本化 reviewer 验证 allow/ask/deny 三条分支。Auto review 是实验功能：多花模型调用、可能误放行/误拒绝，只能在 dsh 侧 profile 启用，不是网关的 `permissionPolicy` 取值。安装、配置和回退见 [docs/auto-review.md](docs/auto-review.md)。
+
+**限制：** dsh-acp 的 ACP 请求本身只带 `toolCallId`，所以申请的模式/理由只能从本会话工具输入里回填；Auto review 的 reviewer reason 来自本地 audit 旁路（不是 ACP 标准），allow 决策按协议没有文本 reason。audit 是 vendored 插件的旁路，dsh 升级时需要重新打补丁。
 
 **回显。** `permissionPolicy` 为 `operator` 时，`prompt` 响应、`start_session` / `load_session` / `get_session(detail="summary")` 的 summary 都带 `permissionNote`（就是上面这些语义的固定说明文本）。`prompt` 响应还回显这一轮实际生效的 `permissionMode` / `permissionPolicy`；这一轮 agent 发过几次权限请求，看 final 视图的 `permissionRequests`。
 

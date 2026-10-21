@@ -1,5 +1,7 @@
-# Select dsh's Auto review permission preset for ACP sessions when DSH_AUTO_REVIEW=1.
-# Mounted after @deepseek-ai/dsh-experimental-auto-review, so the Auto preset is live.
+# Vendored Auto review (audit + explicit-constraint patch) and the Auto preset selector.
+# Both are resolved relative to this profile.
 - insert:
+    - id: auto-review
+      name: './vendor/auto-review/lib/index.js'
     - id: auto-select
       name: './auto-select.mjs'

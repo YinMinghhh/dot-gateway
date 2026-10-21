@@ -70,15 +70,19 @@ before it runs. Ordinary project-local work executes with full host access; medi
 and then ask through the same session/request_permission path. Pair it with permissionPolicy=operator so those
 questions reach you in pendingPermissions; read_only would answer them without asking. Auto review is a dsh
 experimental feature, costs extra model calls, and is enabled by the gateway deployment's agent config, not by
-an ACP call. When list_agents advertises an 'auto' mode, prefer it for tasks that write or execute, and keep
+an ACP call. A vendored Auto review deployment also returns prompt.reviewMode and prompt.toolReviews (decision,
+risk, reason, source, executedSandbox), and pendingPermissions entries carry review/approvalSource; allow has no
+textual reason by dsh's reviewer protocol, deny/ask do. When list_agents advertises an 'auto' mode, prefer it for tasks that write or execute, and keep
 permissionPolicy=operator so Auto review questions reach you.
 pendingPermissions entries are {permissionId, promptId, toolCallId, tool, title, kind, status, command,
-commandBytes, commandTruncated, sandboxPermissions, justification, options}: dsh-acp sends only the toolCallId,
-and the gateway backfills title/kind/status/rawInput from this session's tool records. `tool` is one line like
-'bash: rm -rf … → in_progress'; `command` is the full command (capped at 16 KiB, with commandBytes /
-commandTruncated); sandboxPermissions is a dsh per-call widening request when present, and justification is the
-model's stated reason when present. Auto review's reviewer reason is not part of the tool input and has no ACP
-field, so it cannot be shown.
+commandBytes, commandTruncated, sandboxPermissions, justification, approvalSource, review, options}: dsh-acp
+sends only the toolCallId, and the gateway backfills title/kind/status/rawInput from this session's tool records.
+`tool` is one line like 'bash: rm -rf … → in_progress'; `command` is the full command (capped at 16 KiB, with
+commandBytes / commandTruncated); sandboxPermissions is a dsh per-call widening request when present, and
+justification is the model's stated reason when present. For Auto review asks, `review` and
+approvalSource='auto-review' come from the local audit side-channel; sandbox escalation uses
+approvalSource='sandbox-escalation'; other requests use 'agent'. Auto review allow decisions have no textual
+reason by protocol; deny/ask decisions carry the reviewer reason in `review`.
 The prompt response echoes the turn's effective permissionMode and permissionPolicy and adds permissionNote
 under operator; start_session/load_session/get_session summaries add permissionNote under operator as well.
 Sessions survive gateway restarts and machine reboots (prompting re-attaches with session/resume). If the
@@ -190,7 +194,8 @@ def build_server(manager: SessionManager) -> MCPServer:
         "Follow a session's current/last turn. view='final' (default): no event list, just prompt = {state, "
         "stopReason, permissionRequests, progress while running; when finished, permissionRequests stays and "
         "the response that delivers the reply also carries text = the agent's final reply (its last message), "
-        "toolCalls = one line per tool call, toolCallIds = the matching ids, gitSummary; with "
+        "toolCalls = one line per tool call, toolCallIds = the matching ids, gitSummary; Auto review sessions "
+        "also add reviewMode and toolReviews = per-call decision/risk/reason/source/executedSandbox; with "
         "includeToolOutput=true also toolOutputs = bounded tool output excerpts}. The 'final' view does "
         "not page events: nextSequence is always latestSequence and hasMore is always false. The final text is "
         "delivered once: 'final' returns it in the first response that sees the turn finished and never repeats "
@@ -207,9 +212,10 @@ def build_server(manager: SessionManager) -> MCPServer:
         "outputBytes, truncated}, 2 KiB per call and 8 KiB per response - the full record is get_tool_call. "
         "pendingPermissions lists open permission requests while the turn waits: {permissionId, promptId, "
         "toolCallId, tool, title, kind, status, command, commandBytes, commandTruncated, sandboxPermissions, "
-        "justification, options}; tool is one line backfilled from this session's tool records (e.g. "
-        "'bash: rm -rf … → in_progress'); command is the full command capped at 16 KiB; sandboxPermissions and "
-        "justification appear when dsh put them in the tool input; Auto review's reviewer reason is not available. "
+        "justification, approvalSource, review, options}; tool is one line backfilled from this session's tool "
+        "records (e.g. 'bash: rm -rf … → in_progress'); command is the full command capped at 16 KiB; "
+        "sandboxPermissions and justification appear when dsh put them in the tool input; Auto review asks add "
+        "review and approvalSource='auto-review'. "
         "Under 'operator' an escalation "
         "to a wider sandbox waits there until resolve_permission; empty pendingPermissions and "
         "permissionRequests=0 are normal. ACP has no exit-code field and dsh does not always print one: use "
@@ -227,8 +233,9 @@ def build_server(manager: SessionManager) -> MCPServer:
     @tool(description=(
         "One tool call's full record: title, kind, status, input (rawInput) and output text, paged by bytes "
         "(offset / nextOffset, maxBytes<=256 KiB). toolCallId comes from view='messages' or 'full' events, or "
-        "get_session(detail='full'). Use the full stdout/stderr here plus status as evidence: ACP has no "
-        "exit-code field and dsh does not always print one, so no tool promises an exit code."))
+        "get_session(detail='full'). When Auto review audited the call, the record also has review = "
+        "{decision, risk, reason, source, executedSandbox}. Use the full stdout/stderr here plus status as "
+        "evidence: ACP has no exit-code field and dsh does not always print one, so no tool promises an exit code."))
     async def get_tool_call(sessionId: str, toolCallId: str, offset: int = 0, maxBytes: int = 32_768) -> str:
         return await _call(manager.get_tool_call(sessionId, toolCallId, offset=offset, max_bytes=maxBytes))
 
@@ -244,10 +251,11 @@ def build_server(manager: SessionManager) -> MCPServer:
 
     @tool(description=(
         "One session. detail='summary' (default): state, permissionMode/permissionPolicy (plus permissionNote "
-        "under 'operator'), pendingPermissions ({permissionId, promptId, toolCallId, tool, options}) and recent "
-        "prompts (state, preview, textBytes, deliveredAtSequence) without reply text. detail='full': also every "
-        "listed prompt's final reply text (the reliable way to recover a reply), tool-call lines with toolCallIds, "
-        "git summary, config options (models), capabilities and agent process info."))
+        "under 'operator'), reviewMode for Auto review, pendingPermissions (same fields as get_events, including "
+        "review/approvalSource) and recent prompts (state, preview, textBytes, deliveredAtSequence) without reply "
+        "text. detail='full': also every listed prompt's final reply text (the reliable way to recover a reply), "
+        "tool-call lines with toolCallIds and their Auto review review data, git summary, config options (models), "
+        "capabilities and agent process info."))
     async def get_session(sessionId: str, detail: str = "summary", promptsLimit: int = 10,
                           replyBytes: int = 65_536) -> str:
         return await _call(manager.get_session(sessionId, prompts_limit=promptsLimit, detail=detail,
