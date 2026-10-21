@@ -39,7 +39,7 @@ scripts/start.sh --port 18765          # 本地试跑时换一个端口，不要
 
 ## 工具语义（简洁输出）
 
-每个工具返回**一个紧凑的 JSON 文本块**（不缩进），字段统一用 camelCase。网关**不返回 `structuredContent`**：同一份 JSON 不再重复一份，文本块就是稳定契约，调用方只解析 `content[0].text` 即可。
+每个工具返回**一个紧凑的 JSON 文本块**（不缩进），字段统一用 camelCase；默认不返回 `structuredContent`，文本块就是稳定契约。部署设置 `DOT_GATEWAY_STRUCTURED_OUTPUT=1` 时，同一份 JSON 对象会同时放进 `structuredContent`（默认关闭，避免重复 payload）。
 
 - `start_session` / `load_session` 只返回 `sessionId`、`agentId`、`cwd`、`state`、`live`、`permissionMode`、`permissionPolicy`，再加上 `promptId` 或 `note`（如果有）。`permissionPolicy` 为 `operator` 时另有 `permissionNote`（一段固定的说明文本）。
 - `prompt` 返回 `{sessionId, promptId, permissionMode, permissionPolicy, prompt}`；`permissionMode` / `permissionPolicy` 是这一轮实际生效的值，`permissionPolicy` 为 `operator` 时另有 `permissionNote`。设了 `waitMs` 并且这一轮在时限内跑完，`prompt.text` 就是最终答复，算作已经投递。
@@ -59,7 +59,7 @@ scripts/start.sh --port 18765          # 本地试跑时换一个端口，不要
   - `prompt(waitMs=...)` 在调用里直接交付的答复，用 `get_events(includeText=true)` 或 `get_session(detail="full")` 恢复。
   
   投递状态保存在 `session.json` 里，网关重启后也不会丢；`messages` / `full` 的同游标恢复用的是交付时记下的游标。升级前已经交付过、但没有记录游标的旧轮次，用 `includeText=true` 或 `get_session(detail="full")` 恢复。
-- **等审批时看 `pendingPermissions`。** `get_events`（任何视图）和 `get_session` 在轮次等待权限回答时会带 `pendingPermissions`：`[{permissionId, promptId, toolCallId, tool, options}]`。dsh-acp 的请求只带 `toolCallId`，网关用本会话的工具记录回填成一行 `tool`（例如 `bash: rm -rf … → in_progress`），回填不到就是 `tool`；`options` 里的 `optionId` 交给 `resolve_permission`。
+- **等审批时看 `pendingPermissions`。** `get_events`（任何视图）和 `get_session` 在轮次等待权限回答时会带 `pendingPermissions`：`[{permissionId, promptId, toolCallId, tool, title?, kind?, status?, command?, commandBytes?, commandTruncated?, sandboxPermissions?, justification?, options}]`。dsh-acp 的请求只带 `toolCallId`，网关从本会话工具记录回填一行 `tool`（例如 `bash: rm -rf … → in_progress`）、完整 `command`（上限 16 KiB）以及能回填到的 `sandboxPermissions`/`justification`；`options` 里的 `optionId` 交给 `resolve_permission`。
 - `get_session(detail="summary")` 不带答复正文；summary 和 `start_session` / `load_session` 一样带 `permissionMode`、`permissionPolicy`、`permissionNote`（operator 时）和 `pendingPermissions`。`detail="full"` 会带上每一轮的答复、工具调用行和 `toolCallId`、git 摘要、配置项（可选模型）、agent 能力和进程信息。
 - `get_tool_call(sessionId, toolCallId, offset, maxBytes)` 返回某次工具调用的完整输入和输出，输出按字节分页（每页最大 256 KiB）。这份完整记录存在 `tool-calls/<id>.json`，每个字符串最多 1 MiB。事件日志里的字符串只保留到 8 KiB。
 - **拿不到退出码。** ACP 的 `tool_call_update` 没有独立的 exit code 字段，dsh 的成功命令输出里也可能没有退出码标记。判断成败看 `status`（例如 `completed` / `failed`）、`toolOutputs` 或事件里的 stdout/stderr 文本，以及 `get_tool_call` 的完整输出；文档和工具描述都不承诺退出码。
@@ -99,13 +99,13 @@ scripts/start.sh --port 18765          # 本地试跑时换一个端口，不要
 
 **空 `pendingPermissions` 和 0 条 `permissionRequests` 通常是正常的。** 实测 dsh 0.2.1-rc.2 在 `workspace-write` 下创建/编辑文件、执行 shell 命令都不会发权限请求，所以默认的 `read_only` 挡不住这类操作，`operator` 也没有东西可挂；没有挂起项不代表策略没生效。
 
-**`pendingPermissions` 的条目**是 `{permissionId, promptId, toolCallId, tool, options}`。dsh-acp 的请求只带 `toolCallId`，网关会从本会话的工具记录（`tool-calls/<id>.json` 和当前轮的摘要）回填 title/kind/status/rawInput，把 `tool` 渲染成一行，例如 `bash: rm -rf … → in_progress`；回填不到时保持 `tool`。
+**`pendingPermissions` 的条目**是 `{permissionId, promptId, toolCallId, tool, title?, kind?, status?, command?, commandBytes?, commandTruncated?, sandboxPermissions?, justification?, options}`。dsh-acp 的请求只带 `toolCallId`，网关会从本会话的工具记录回填 title/kind/status/rawInput：`tool` 是一行摘要；`command` 是完整命令（上限 16 KiB，`commandBytes`/`commandTruncated` 标明是否截断）；`sandboxPermissions` 是 agent 单次扩权申请（如有）；`justification` 是模型给的理由（如有）。回填不到时只有 `tool`。
 
 **allow-once 只放宽该次调用**，不改变会话的 `permissionMode`。要整个会话换档，用 `prompt(permissionMode=...)`（网关会重启 agent 并 `session/resume`）。
 
 **Auto review（可选部署）。** dsh 自带一个实验性的 Auto review 层：profile 里挂上后权限预设多一个 `auto`（full access + ask），每个受支持的工具调用执行前让当前模型先审一遍。低风险调用直接以 full access 执行；medium/high 风险被拒绝时走 approval `ask`，由 dsh-acp 桥接成 ACP 权限请求。网关要暴露它，需要在 dsh agent 的 `permission_modes` 里加 `auto`（把 args 指向 `--profile acp-auto`），并建议把 `permissionPolicy` 设为 `operator`——否则这类 ask 会被默认的 `read_only` 自动拒绝。Auto review 是实验功能：多花模型调用、可能误放行/误拒绝，只能在 dsh 侧 profile 启用，不是网关的 `permissionPolicy` 取值。安装、配置和回退见 [docs/auto-review.md](docs/auto-review.md)。
 
-**限制：** dsh-acp 目前不把申请的模式和 `justification` 透传给 ACP，所以网关只能回填工具信息，不能展示“申请 `danger-full-access` 及原因”；Auto review 的审查理由同样没有 ACP 字段可透传。
+**限制：** dsh-acp 的 ACP 请求本身只带 `toolCallId`，所以申请的模式/理由只能从本会话工具输入里回填；Auto review 的审查理由不是工具输入的一部分，ACP 也没有对应字段，`pendingPermissions` 里看不到 reviewer reason。
 
 **回显。** `permissionPolicy` 为 `operator` 时，`prompt` 响应、`start_session` / `load_session` / `get_session(detail="summary")` 的 summary 都带 `permissionNote`（就是上面这些语义的固定说明文本）。`prompt` 响应还回显这一轮实际生效的 `permissionMode` / `permissionPolicy`；这一轮 agent 发过几次权限请求，看 final 视图的 `permissionRequests`。
 
@@ -143,6 +143,7 @@ scripts/start.sh --port 18765          # 本地试跑时换一个端口，不要
 | `DOT_GATEWAY_DSH_BIN` | — | `/opt/homebrew/bin/dsh` | dsh 路径 |
 | `DOT_GATEWAY_DSH_PERMISSION_MODE` | — | `workspace-write` | dsh 默认 permissionMode |
 | `DOT_GATEWAY_PERMISSION_POLICY` | — | `read_only` | 默认 permissionPolicy |
+| `DOT_GATEWAY_STRUCTURED_OUTPUT` | — | 关闭 | 部署级开关：工具结果同时返回 structuredContent；也可在配置 `defaults.structured_output` 里设 |
 | `DOT_GATEWAY_EXTRA_PATH` | — | `/opt/homebrew/bin:/usr/local/bin` | 加到 agent 的 PATH 前面（launchd 下的 PATH 很短） |
 | `DOT_GATEWAY_STARTUP_TIMEOUT` | — | `25` | 启动 agent 时每一步最多等几秒 |
 | `DOT_GATEWAY_LOG_LEVEL` | `--log-level` | `INFO` | 日志级别，日志写到 stderr |

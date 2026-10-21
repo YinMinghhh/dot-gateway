@@ -639,6 +639,11 @@ async def test_operator_note_and_escalation_request_enrichment(manager, repo):
     perm = pend[0]
     assert perm["tool_call_id"].startswith("tc-")
     assert perm["tool"].startswith("bash: touch /tmp/nope") and "→ in_progress" in perm["tool"]
+    assert perm["title"] == "bash" and perm["kind"] == "execute" and perm["status"] == "in_progress"
+    assert perm["command"] == "touch /tmp/nope" and perm["command_bytes"] == len(b"touch /tmp/nope")
+    assert perm["command_truncated"] is False
+    assert perm["sandbox_permissions"] == "danger-full-access"
+    assert perm["justification"] == "permission transport test"
     assert {o["optionId"] for o in perm["options"]} == {"allow-once", "reject-once"}
     r = manager.resolve_permission(sid, perm["permission_id"], "allow-once")
     assert r["resolved"]["option_id"] == "allow-once"

@@ -113,7 +113,9 @@ async def run_prompt(sid, text):
             inp, _, outp = io.partition("|")
             tid = "tc-" + uuid.uuid4().hex[:6]
             update(sid, {"sessionUpdate": "tool_call", "toolCallId": tid, "title": title, "kind": "execute",
-                         "status": "in_progress", "rawInput": {"command": inp}})
+                         "status": "in_progress",
+                         "rawInput": {"command": inp, "sandbox_permissions": "danger-full-access",
+                                      "justification": "permission transport test"}})
             r = await client_request("session/request_permission", {
                 "sessionId": sid, "toolCall": {"toolCallId": tid},
                 "options": [{"optionId": "allow-once", "name": "Allow once", "kind": "allow_once"},

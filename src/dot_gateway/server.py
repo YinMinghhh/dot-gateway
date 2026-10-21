@@ -13,6 +13,7 @@ from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.types import CallToolResult, TextContent
 
 from . import __version__
 from .acp import AcpError
@@ -21,6 +22,8 @@ from .config import PERMISSION_POLICIES, Config
 from .sessions import SessionError, SessionManager
 
 log = logging.getLogger("dot_gateway")
+# Deployment-level switch; set by build_server from manager.config.structured_output.
+_STRUCTURED_OUTPUT = False
 
 INSTRUCTIONS = """\
 Run coding agents (default: dsh, DeepSeek Harness) on this machine as multi-turn ACP sessions.
@@ -31,6 +34,9 @@ permission question appears) -> read prompt.text (the agent's final reply, sent 
 conversation -> close_session when done.
 Every call returns within 60 s (the tunnel allows 120 s). One prompt at a time per session: prompting a busy
 session fails with SESSION_BUSY. Keep the sessionId; list_sessions finds it again.
+Results are one compact JSON text block. A deployment may enable structured output (DOT_GATEWAY_STRUCTURED_OUTPUT=1,
+default off): every result then also carries the same JSON object in structuredContent, while the text block stays
+the canonical compact form.
 get_events views: 'final' (default) returns prompt only and does not page events (nextSequence is always
 latestSequence, hasMore is always false); 'messages' = whole messages + one line per tool call; 'full'
 (+ includeThoughts) = raw ACP updates. Only messages/full page through events: pass nextSequence back as
@@ -66,10 +72,13 @@ questions reach you in pendingPermissions; read_only would answer them without a
 experimental feature, costs extra model calls, and is enabled by the gateway deployment's agent config, not by
 an ACP call. When list_agents advertises an 'auto' mode, prefer it for tasks that write or execute, and keep
 permissionPolicy=operator so Auto review questions reach you.
-pendingPermissions entries are {permissionId, promptId, toolCallId, tool, options}: dsh-acp sends only the
-toolCallId, and the gateway backfills title/kind/status/input from this session's tool records into `tool`, one
-line like 'bash: rm -rf … → in_progress' ('tool' if nothing can be backfilled). Limit: dsh-acp does not forward
-the requested mode or justification, so the gateway cannot show which wider mode was asked for, or why.
+pendingPermissions entries are {permissionId, promptId, toolCallId, tool, title, kind, status, command,
+commandBytes, commandTruncated, sandboxPermissions, justification, options}: dsh-acp sends only the toolCallId,
+and the gateway backfills title/kind/status/rawInput from this session's tool records. `tool` is one line like
+'bash: rm -rf … → in_progress'; `command` is the full command (capped at 16 KiB, with commandBytes /
+commandTruncated); sandboxPermissions is a dsh per-call widening request when present, and justification is the
+model's stated reason when present. Auto review's reviewer reason is not part of the tool input and has no ACP
+field, so it cannot be shown.
 The prompt response echoes the turn's effective permissionMode and permissionPolicy and adds permissionNote
 under operator; start_session/load_session/get_session summaries add permissionNote under operator as well.
 Sessions survive gateway restarts and machine reboots (prompting re-attaches with session/resume). If the
@@ -101,12 +110,17 @@ def camelize(obj: Any) -> Any:
     return out
 
 
-def compact(res: Any) -> str:
-    """One compact JSON text block per tool result (no indentation, no duplicate structuredContent)."""
-    return json.dumps(camelize(res), ensure_ascii=False, separators=(",", ":"))
+def compact(res: Any) -> str | CallToolResult:
+    """One compact JSON text block per tool result. With the deployment switch on, the same object is also
+    returned as structuredContent; default remains text-only (no duplicate payload)."""
+    obj = camelize(res)
+    text = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    if not _STRUCTURED_OUTPUT:
+        return text
+    return CallToolResult(content=[TextContent(type="text", text=text)], structured_content=obj)
 
 
-async def _call(coro_or_value) -> str:
+async def _call(coro_or_value) -> Any:
     try:
         res = await coro_or_value if hasattr(coro_or_value, "__await__") else coro_or_value
     except (SessionError, AgentError, AcpError) as e:
@@ -114,7 +128,7 @@ async def _call(coro_or_value) -> str:
     return compact(res)
 
 
-def _sync(fn, *a, **kw) -> str:
+def _sync(fn, *a, **kw) -> Any:
     try:
         return compact(fn(*a, **kw))
     except (SessionError, AgentError, AcpError) as e:
@@ -125,7 +139,10 @@ def build_server(manager: SessionManager) -> MCPServer:
     server = MCPServer(name="dot-gateway", title="Local coding agents (ACP)", version=__version__,
                        instructions=INSTRUCTIONS, log_level=manager.config.log_level)  # type: ignore[arg-type]
     policies = " | ".join(PERMISSION_POLICIES)
-    # Text-only contract: one compact JSON text block, no duplicate structuredContent. Keep it that way.
+    global _STRUCTURED_OUTPUT
+    _STRUCTURED_OUTPUT = manager.config.structured_output
+    # structured_output=False keeps output schemas out; when the deployment switch is on, compact() attaches
+    # structuredContent manually next to the same text block.
     tool = functools.partial(server.tool, structured_output=False)
 
     @tool(description="List configured ACP agents (dsh built in; more via the gateway config file), "
@@ -189,8 +206,11 @@ def build_server(manager: SessionManager) -> MCPServer:
         "includeToolOutput=true adds prompt.toolOutputs for a finished turn: {toolCallId, title, status, output, "
         "outputBytes, truncated}, 2 KiB per call and 8 KiB per response - the full record is get_tool_call. "
         "pendingPermissions lists open permission requests while the turn waits: {permissionId, promptId, "
-        "toolCallId, tool, options}; tool is one line backfilled from this session's tool records (e.g. "
-        "'bash: rm -rf … → in_progress'), or 'tool' when nothing can be backfilled. Under 'operator' an escalation "
+        "toolCallId, tool, title, kind, status, command, commandBytes, commandTruncated, sandboxPermissions, "
+        "justification, options}; tool is one line backfilled from this session's tool records (e.g. "
+        "'bash: rm -rf … → in_progress'); command is the full command capped at 16 KiB; sandboxPermissions and "
+        "justification appear when dsh put them in the tool input; Auto review's reviewer reason is not available. "
+        "Under 'operator' an escalation "
         "to a wider sandbox waits there until resolve_permission; empty pendingPermissions and "
         "permissionRequests=0 are normal. ACP has no exit-code field and dsh does not always print one: use "
         "status, the stdout/stderr text, and get_tool_call as evidence, not an exit code."))

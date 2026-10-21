@@ -47,6 +47,7 @@ MAX_TOOL_SUMMARIES = 200  # one-line tool summaries kept per prompt
 TOOL_OUTPUT_PREVIEW_BYTES = 2 * 1024  # per tool call, for get_events(includeToolOutput=true)
 TOOL_OUTPUT_TOTAL_BYTES = 8 * 1024  # whole toolOutputs list, for get_events(includeToolOutput=true)
 TOOL_OUTPUT_MAX_ITEMS = 50
+PENDING_COMMAND_BYTES = 16 * 1024  # full command preview kept in pendingPermissions
 VIEWS = ("final", "messages", "full")
 _QUIET_KINDS = {"usage_update", "available_commands_update", "config_option_update", "current_mode_update"}
 MAX_PROMPT_WAIT_MS = 60_000  # prompt(waitMs): returns 'running' after this
@@ -641,18 +642,48 @@ class SessionManager:
             view["permission_note"] = OPERATOR_PERMISSION_NOTE
         return view
 
-    @staticmethod
-    def _pending(rec: dict[str, Any]) -> list[dict[str, Any]]:
+    def _pending(self, rec: dict[str, Any]) -> list[dict[str, Any]]:
+        sid = rec["session_id"]
         out = []
         for info in rec.get("pending_permissions") or []:
-            tc = info.get("toolCall") or {}
-            out.append({"permission_id": info.get("permissionId"), "prompt_id": info.get("promptId"),
-                        "tool_call_id": tc.get("toolCallId"),
-                        "tool": _tool_line({"title": tc.get("title"), "kind": tc.get("kind"),
-                                            "status": tc.get("status"),
-                                            "input": _one_line(tc.get("rawInput")) if tc.get("rawInput") else None}),
-                        "options": [{"optionId": o.get("optionId"), "name": o.get("name"), "kind": o.get("kind")}
-                                    for o in info.get("options") or []]})
+            tc = dict(info.get("toolCall") or {})
+            tcid = tc.get("toolCallId")
+            # dsh-acp's ACP request carries only the toolCallId; prefer the full local tool record so the
+            # caller can see the complete command / requested sandbox level / justification.
+            if tcid:
+                try:
+                    full = json.loads(self._tool_path(sid, str(tcid)).read_text())
+                except (OSError, ValueError):
+                    full = None
+                if full:
+                    for k in ("title", "kind", "status", "rawInput"):
+                        if full.get(k) is not None:
+                            tc[k] = full[k]
+            entry: dict[str, Any] = {
+                "permission_id": info.get("permissionId"), "prompt_id": info.get("promptId"),
+                "tool_call_id": tcid,
+                "tool": _tool_line({"title": tc.get("title"), "kind": tc.get("kind"), "status": tc.get("status"),
+                                    "input": _one_line(tc.get("rawInput")) if tc.get("rawInput") else None}),
+                "options": [{"optionId": o.get("optionId"), "name": o.get("name"), "kind": o.get("kind")}
+                            for o in info.get("options") or []],
+            }
+            for key in ("title", "kind", "status"):
+                if tc.get(key) is not None:
+                    entry[key] = tc[key]
+            raw = tc.get("rawInput")
+            if isinstance(raw, dict):
+                command = raw.get("command")
+                if isinstance(command, str):
+                    encoded = command.encode()
+                    chunk = encoded[:PENDING_COMMAND_BYTES].decode("utf-8", errors="ignore")
+                    entry["command"] = chunk
+                    entry["command_bytes"] = len(encoded)
+                    entry["command_truncated"] = len(chunk.encode()) < len(encoded)
+                if raw.get("sandbox_permissions") is not None:
+                    entry["sandbox_permissions"] = str(raw["sandbox_permissions"])
+                if raw.get("justification") is not None:
+                    entry["justification"] = str(raw["justification"])
+            out.append(entry)
         return out
 
     def _last_prompt(self, rec: dict[str, Any]) -> dict[str, Any] | None:

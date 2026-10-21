@@ -10,6 +10,12 @@ from pathlib import Path
 PERMISSION_POLICIES = ("read_only", "operator", "allow_all", "deny_all")
 
 
+def _env_flag(value: str | None, default: bool) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
 def _default_state_dir() -> Path:
     return Path.home() / "Library" / "Application Support" / "dot-gateway"
 
@@ -27,6 +33,8 @@ class Config:
     dsh_permission_mode: str = ""
     # How the gateway answers ACP session/request_permission unless a call overrides it.
     default_permission_policy: str = "read_only"
+    # Deployment-level switch: also return the same JSON object as MCP structuredContent (default off).
+    structured_output: bool = False
     # Prepended to PATH for agent processes (launchd's PATH is bare; dsh needs `env node`).
     extra_path: str = "/opt/homebrew/bin:/usr/local/bin"
     # Per-step limit (initialize, session/new|resume|list): calls that start an agent stay well under ~60 s.
@@ -51,6 +59,7 @@ class Config:
         c.dsh_bin = env.get("DOT_GATEWAY_DSH_BIN", c.dsh_bin)
         c.dsh_permission_mode = env.get("DOT_GATEWAY_DSH_PERMISSION_MODE", c.dsh_permission_mode)
         c.default_permission_policy = env.get("DOT_GATEWAY_PERMISSION_POLICY", c.default_permission_policy)
+        c.structured_output = _env_flag(env.get("DOT_GATEWAY_STRUCTURED_OUTPUT"), c.structured_output)
         c.extra_path = env.get("DOT_GATEWAY_EXTRA_PATH", c.extra_path)
         c.startup_timeout = float(env.get("DOT_GATEWAY_STARTUP_TIMEOUT", c.startup_timeout))
         c.log_level = env.get("DOT_GATEWAY_LOG_LEVEL", c.log_level).upper()
@@ -67,5 +76,7 @@ class Config:
             return
         d = data.get("defaults") or {}
         self.default_permission_policy = d.get("permission_policy", self.default_permission_policy)
+        if isinstance(d.get("structured_output"), bool):
+            self.structured_output = d["structured_output"]
         self.dsh_permission_mode = d.get("dsh_permission_mode", self.dsh_permission_mode)
         self.dsh_bin = d.get("dsh_bin", self.dsh_bin)

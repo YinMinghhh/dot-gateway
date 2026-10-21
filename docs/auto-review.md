@@ -69,7 +69,7 @@ deploy/dsh-acp-auto/install.sh
 
 - **实验功能**：会为每个受支持的工具调用额外调用一次当前模型（更多 token/延迟），可能误放行或误拒绝；dsh 升级可能改变策略或接口。
 - Auto preset 是 **full access + ask**：被 Auto review 放行的调用不受 workspace 边界限制。这正是它的用途，但也意味着不要把它当成比 workspace-write 更小的沙箱。
-- Auto review 的审查理由/风险等级目前没有 ACP 字段可透传，故 `pendingPermissions` 只能看到工具信息（命令等）和 allow/reject 选项，看不到 reviewer 的 reason。
+- Auto review 的审查理由/风险等级没有 ACP 字段可透传；`pendingPermissions` 现在会带工具记录里能回填的完整命令（上限 16 KiB）和 `sandboxPermissions`/justification（如有），但看不到 reviewer 的 reason。
 - 只对 dsh 的 ACP profile 生效；`pi` 等其他 agent 不受影响。
 - dsh 的 `danger-full-access` preset 仍是 `approval: never`；Auto 不是它的别名。
 

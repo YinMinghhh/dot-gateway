@@ -138,3 +138,17 @@ def test_camelize_keeps_acp_payloads():
                     "pending_permissions": [{"tool_call": {"a_b": 1}}], "git_summary": {"status_short": ""}})
     assert out == {"sessionId": "s", "events": [{"sequence": 1, "update": {"raw_input": {"file_path": "x"}}}],
                    "pendingPermissions": [{"toolCall": {"a_b": 1}}], "gitSummary": {"statusShort": ""}}
+
+
+@pytest.mark.anyio
+async def test_structured_output_switch(manager):
+    """Default is text-only; the deployment switch adds the same object as structuredContent."""
+    manager.config.structured_output = True
+    try:
+        async with Client(build_server(manager)) as client:
+            r = await client.call_tool("list_agents", {})
+            assert not r.is_error and r.structured_content is not None
+            assert len(r.content) == 1 and r.content[0].type == "text"
+            assert json.loads(r.content[0].text) == r.structured_content
+    finally:
+        manager.config.structured_output = False
